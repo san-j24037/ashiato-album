@@ -12,6 +12,8 @@ import {
   Cloud,
   Compass,
   Crosshair,
+  Eye,
+  EyeOff,
   Footprints,
   Heart,
   LocateFixed,
@@ -31,7 +33,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
-import { loadAccountData, loadAppState, saveAppData, setActiveAccount } from './data'
+import { loadAccountData, saveAppData, setActiveAccount } from './data'
 import { emptyAppData, type AppData, type Memory, type TrackPoint } from './types'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
@@ -46,6 +48,7 @@ const intervals = [
 
 type Tab = 'map' | 'spots' | 'settings'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData }
+type AccountProfile = { id: string; name: string; email: string }
 
 function readInterval() {
   const value = Number(localStorage.getItem(INTERVAL_KEY))
@@ -188,14 +191,22 @@ function App() {
   const [data, setData] = useState<AppData>(emptyAppData)
   const [dataLoaded, setDataLoaded] = useState(false)
   const [accountSub, setAccountSub] = useState<string | null>(null)
+  const [account, setAccount] = useState<AccountProfile | null>(null)
+  const [authReady, setAuthReady] = useState(false)
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
+  const [authName, setAuthName] = useState('')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState('')
+  const [privacyAccepted, setPrivacyAccepted] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState('')
   const [tab, setTab] = useState<Tab>('map')
   const [active, setActive] = useState(false)
   const [intervalSeconds, setIntervalSeconds] = useState(readInterval)
-  const [identityToken, setIdentityToken] = useState<string | null>(null)
   const [accessToken, setAccessToken] = useState<string | null>(null)
   const [accessTokenExpiresAt, setAccessTokenExpiresAt] = useState(0)
-  const [showGoogleLogin, setShowGoogleLogin] = useState(false)
-  const [googleReady, setGoogleReady] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [message, setMessage] = useState('')
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null)
@@ -209,28 +220,45 @@ function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [centerRequest, setCenterRequest] = useState<[number, number] | null>(null)
   const mediaInputRef = useRef<HTMLInputElement>(null)
-  const googleButtonRef = useRef<HTMLDivElement>(null)
   const webWatchId = useRef<number | null>(null)
   const intervalRef = useRef(intervalSeconds)
   const lastAcceptedTimeRef = useRef(0)
-  const pendingOAuthStateRef = useRef<string | null>(null)
-  const syncDataRef = useRef<(token: string | null) => Promise<void>>(async () => {})
+  const syncDataRef = useRef<(sourceData?: AppData) => Promise<void>>(async () => {})
 
   useEffect(() => {
     let cancelled = false
-    void loadAppState().then(({ data: saved, accountSub: savedAccountSub }) => {
-      if (!cancelled) {
-        setData(saved)
-        setAccountSub(savedAccountSub)
-        setDataLoaded(true)
-      }
-    }).catch((error: unknown) => {
-      console.error('足跡データを読み込めませんでした。', error)
-      if (!cancelled) {
-        setDataLoaded(true)
-        setMessage('端末内の記録を読み込めませんでした')
-      }
-    })
+    void fetch('/api/auth', { credentials: 'same-origin', cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`ログイン状態を確認できませんでした (${response.status})`)
+        return await response.json() as { ok: boolean; user: AccountProfile | null }
+      })
+      .then(async (result) => {
+        if (!result.ok) throw new Error('ログイン状態を確認できませんでした')
+        if (result.user) {
+          const saved = await loadAccountData(result.user.id)
+          await setActiveAccount(result.user.id)
+          if (!cancelled) {
+            setAccount(result.user)
+            setAccountSub(result.user.id)
+            setData(saved)
+            setDataLoaded(true)
+            setAuthReady(true)
+            void syncDataRef.current(saved)
+          }
+        } else if (!cancelled) {
+          setData(emptyAppData)
+          setAccountSub(null)
+          setDataLoaded(false)
+          setAuthReady(true)
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('ログイン状態を確認できませんでした。', error)
+        if (!cancelled) {
+          setAuthError('サーバーに接続できません。公開URLと認証設定を確認してください。')
+          setAuthReady(true)
+        }
+      })
     return () => { cancelled = true }
   }, [])
 
@@ -337,6 +365,99 @@ function App() {
 
   const onSelectMemory = useCallback((memory: Memory) => setSelectedMemory(memory), [])
 
+  const finishLogin = async (user: AccountProfile) => {
+    const saved = await loadAccountData(user.id)
+    await setActiveAccount(user.id)
+    setAccount(user)
+    setAccountSub(user.id)
+    setData(saved)
+    setDataLoaded(true)
+    setHasSynced(false)
+    setAuthPassword('')
+    setAuthPasswordConfirm('')
+    setPrivacyAccepted(false)
+    void syncDataRef.current(saved)
+  }
+
+  const submitAuthentication = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAuthError('')
+    if (authMode === 'register') {
+      if (authPassword !== authPasswordConfirm) {
+        setAuthError('確認用パスワードが一致しません')
+        return
+      }
+      if (!privacyAccepted) {
+        setAuthError('データの保存について確認してください')
+        return
+      }
+    }
+    setAuthBusy(true)
+    try {
+      const response = await fetch('/api/auth', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: authMode,
+          name: authName,
+          email: authEmail,
+          password: authPassword,
+        }),
+      })
+      const result = await response.json() as { ok: boolean; user?: AccountProfile; error?: string }
+      if (!response.ok || !result.ok || !result.user) {
+        throw new Error(result.error ?? (authMode === 'login' ? 'メールアドレスまたはパスワードが正しくありません' : 'アカウントを作成できませんでした'))
+      }
+      await finishLogin(result.user)
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'ログインできませんでした。設定とネットワークを確認してください')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const logout = async () => {
+    setAuthBusy(true)
+    setAuthError('')
+    try {
+      const response = await fetch('/api/auth', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'logout' }),
+      })
+      if (!response.ok) throw new Error('ログアウトできませんでした')
+      if (nativeWatcherRef.current) {
+        await BackgroundGeolocation.removeWatcher({ id: nativeWatcherRef.current })
+        nativeWatcherRef.current = null
+        setNativeWatcherId(null)
+      }
+      if (webWatchId.current !== null) {
+        navigator.geolocation.clearWatch(webWatchId.current)
+        webWatchId.current = null
+      }
+      await setActiveAccount(null)
+      setAccount(null)
+      setAccountSub(null)
+      setData(emptyAppData)
+      setDataLoaded(false)
+      setActive(false)
+      setHasSynced(false)
+      setSelectedMemory(null)
+      setSelectedPoint(null)
+      setTab('map')
+      setAuthMode('login')
+      setAuthPassword('')
+      setAuthPasswordConfirm('')
+      setAuthError('')
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'ログアウトできませんでした')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
   const addMemory = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!selectedPoint || !spotTitle.trim()) return
@@ -427,31 +548,22 @@ function App() {
     }
   }
 
-  const syncData = async (token = identityToken) => {
-    if (!token) {
-      setMessage('先にGoogleアカウントでログインしてください')
-      return
-    }
-    syncDataRef.current = syncData
+  const syncData = useCallback(async (sourceData = data) => {
     setSyncing(true)
     setMessage('')
     try {
-      const tokenPayload = token.split('.')[1]
-      if (!tokenPayload) throw new Error('Googleログイン情報を確認できませんでした')
-      const claims = JSON.parse(atob(tokenPayload.replace(/-/g, '+').replace(/_/g, '/'))) as { sub?: string }
-      if (!claims.sub) throw new Error('Googleログイン情報にアカウントIDがありません')
-      const targetSub = claims.sub
-      const uploadData = accountSub && accountSub !== targetSub ? await loadAccountData(targetSub) : data
+      const uploadData = sourceData
       const batchCount = Math.max(1, Math.ceil(uploadData.points.length / 3000), Math.ceil(uploadData.memories.length / 100))
       let remoteData: AppData | undefined
       let synchronizedData: AppData | undefined
       for (let index = 0; index < batchCount; index += 1) {
         const pointBatch = uploadData.points.slice(index * 3000, (index + 1) * 3000)
         const memoryBatch = uploadData.memories.slice(index * 100, (index + 1) * 100)
-        const response = await fetch(`${API_BASE_URL ?? ''}/api/sync`, {
+        const response = await fetch('/api/sync', {
           method: 'POST',
+          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken: token, data: { points: pointBatch, memories: memoryBatch } }),
+          body: JSON.stringify({ data: { points: pointBatch, memories: memoryBatch } }),
         })
         const result = (await response.json()) as SyncResponse
         if (!response.ok || !result.ok) throw new Error(result.error ?? `同期に失敗しました (${response.status})`)
@@ -462,17 +574,18 @@ function App() {
         const memories = new Map([...remoteData.memories, ...uploadData.memories].map((memory) => [memory.id, memory]))
         synchronizedData = { points: [...points.values()], memories: [...memories.values()] }
       }
-      await setActiveAccount(targetSub)
-      setAccountSub(targetSub)
       if (synchronizedData) setData(synchronizedData)
       setHasSynced(true)
-      setMessage('Googleアカウントに同期しました')
+      setMessage('アカウントに同期しました')
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '同期に失敗しました')
     } finally {
       setSyncing(false)
     }
-  }
+  }, [data])
+  useEffect(() => {
+    syncDataRef.current = syncData
+  }, [syncData])
 
   const signIn = () => {
     if (Capacitor.isNativePlatform()) {
@@ -481,18 +594,16 @@ function App() {
         return
       }
       const state = crypto.randomUUID()
-      pendingOAuthStateRef.current = state
       localStorage.setItem('ashiato-pending-oauth-state', state)
       const startUrl = `${API_BASE_URL}/api/oauth/start?state=${encodeURIComponent(state)}`
       setMessage('Googleログインを開いています…')
       void Browser.open({ url: startUrl }).catch((error: unknown) => {
-        pendingOAuthStateRef.current = null
         localStorage.removeItem('ashiato-pending-oauth-state')
         setMessage(error instanceof Error ? error.message : 'Googleログインを開けませんでした')
       })
       return
     }
-    setShowGoogleLogin(true)
+    setTab('settings')
   }
 
   useEffect(() => {
@@ -502,33 +613,30 @@ function App() {
       if (!url.startsWith('jp.ashiato.album://oauth/callback')) return
       const callback = new URL(url)
       const values = new URLSearchParams(callback.hash.slice(1))
-      const expectedState = pendingOAuthStateRef.current ?? localStorage.getItem('ashiato-pending-oauth-state')
+      const expectedState = localStorage.getItem('ashiato-pending-oauth-state')
       if (!expectedState) return
       if (values.get('state') !== expectedState) {
         setMessage('Googleログインの状態を確認できませんでした')
         return
       }
       if (values.has('error')) {
-        pendingOAuthStateRef.current = null
         localStorage.removeItem('ashiato-pending-oauth-state')
         setMessage(values.get('error') ?? 'Googleログインに失敗しました')
         void Browser.close()
         return
       }
-      const token = values.get('id_token')
       const driveToken = values.get('access_token')
       const expiresIn = Number(values.get('expires_in'))
-      pendingOAuthStateRef.current = null
       localStorage.removeItem('ashiato-pending-oauth-state')
-      if (!token || !driveToken || !Number.isFinite(expiresIn) || expiresIn <= 0) {
+      if (!driveToken || !Number.isFinite(expiresIn) || expiresIn <= 0) {
         setMessage('Googleログインに失敗しました。もう一度お試しください')
         return
       }
-      setIdentityToken(token)
       setAccessToken(driveToken)
       setAccessTokenExpiresAt(Date.now() + expiresIn * 1000)
       void Browser.close()
-      void syncDataRef.current(token)
+      setMessage('Google Driveを利用できます')
+      void syncDataRef.current()
     }
     void CapacitorApp.addListener('appUrlOpen', ({ url }) => handleOAuthUrl(url)).then((listener) => {
       if (cancelled) void listener.remove()
@@ -550,32 +658,10 @@ function App() {
     script.src = 'https://accounts.google.com/gsi/client'
     script.async = true
     script.defer = true
-    script.onload = () => setGoogleReady(true)
-    script.onerror = () => setMessage('Googleログインを読み込めませんでした。ネットワークを確認してください')
+    script.onerror = () => setMessage('Google Drive連携を読み込めませんでした。ネットワークを確認してください')
     document.head.appendChild(script)
     return () => script.remove()
   }, [])
-
-  useEffect(() => {
-    if (!showGoogleLogin || !googleReady || !CLIENT_ID || !window.google || !googleButtonRef.current) return
-    googleButtonRef.current.replaceChildren()
-    window.google.accounts.id.initialize({
-      client_id: CLIENT_ID,
-      callback: (response) => {
-        setIdentityToken(response.credential)
-        setShowGoogleLogin(false)
-        void syncDataRef.current(response.credential)
-      },
-    })
-    window.google.accounts.id.renderButton(googleButtonRef.current, {
-      theme: 'outline',
-      size: 'large',
-      shape: 'pill',
-      text: 'signin_with',
-      locale: 'ja',
-      width: 260,
-    })
-  }, [showGoogleLogin, googleReady])
 
   useEffect(() => () => {
     if (webWatchId.current !== null) navigator.geolocation.clearWatch(webWatchId.current)
@@ -585,6 +671,124 @@ function App() {
   const recentMemories = useMemo(() => [...data.memories].reverse(), [data.memories])
   const pointForSpot = selectedPoint ?? data.points[data.points.length - 1]
   const latestDate = data.points.at(-1)?.recordedAt
+
+  if (!authReady) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card" aria-live="polite">
+          <div className="auth-brand"><Footprints size={25} /><span>ashiato</span></div>
+          <p className="auth-description">ログイン状態を確認しています…</p>
+        </section>
+      </main>
+    )
+  }
+
+  if (!account) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <div className="auth-brand"><Footprints size={25} /><span>ashiato</span></div>
+          <div className="section-kicker">MY TRAVEL ALBUM</div>
+          <h1>{authMode === 'login' ? 'ログイン' : 'アカウントを作成'}</h1>
+          <p className="auth-description">
+            {authMode === 'login'
+              ? '旅の足跡とお気に入りスポットを開きます。'
+              : 'メールアドレスとパスワードで利用者登録します。'}
+          </p>
+          <form className="auth-form" onSubmit={submitAuthentication}>
+            {authMode === 'register' && (
+              <>
+                <label className="field-label" htmlFor="auth-name">表示名</label>
+                <input
+                  id="auth-name"
+                  className="text-field"
+                  value={authName}
+                  onChange={(event) => setAuthName(event.target.value)}
+                  autoComplete="name"
+                  maxLength={80}
+                  required
+                />
+              </>
+            )}
+            <label className="field-label" htmlFor="auth-email">メールアドレス</label>
+            <input
+              id="auth-email"
+              className="text-field"
+              type="email"
+              value={authEmail}
+              onChange={(event) => setAuthEmail(event.target.value)}
+              autoComplete="email"
+              maxLength={254}
+              required
+            />
+            <label className="field-label" htmlFor="auth-password">パスワード</label>
+            <div className="password-field">
+              <input
+                id="auth-password"
+                className="text-field"
+                type={showPassword ? 'text' : 'password'}
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+                minLength={authMode === 'register' ? 12 : 1}
+                maxLength={128}
+                required
+              />
+              <button
+                type="button"
+                className="password-toggle"
+                onClick={() => setShowPassword((visible) => !visible)}
+                aria-label={showPassword ? 'パスワードを隠す' : 'パスワードを表示'}
+              >
+                {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
+              </button>
+            </div>
+            {authMode === 'register' && (
+              <>
+                <label className="field-label" htmlFor="auth-password-confirm">パスワード（確認）</label>
+                <input
+                  id="auth-password-confirm"
+                  className="text-field"
+                  type={showPassword ? 'text' : 'password'}
+                  value={authPasswordConfirm}
+                  onChange={(event) => setAuthPasswordConfirm(event.target.value)}
+                  autoComplete="new-password"
+                  minLength={12}
+                  maxLength={128}
+                  required
+                />
+                <label className="auth-consent">
+                  <input
+                    type="checkbox"
+                    checked={privacyAccepted}
+                    onChange={(event) => setPrivacyAccepted(event.target.checked)}
+                    required
+                  />
+                  <span>足跡・スポット情報が端末とアカウント用スプレッドシートに保存されることを確認しました。</span>
+                </label>
+              </>
+            )}
+            {authError && <p className="auth-error" role="alert">{authError}</p>}
+            <button className="primary-button full-button auth-submit" type="submit" disabled={authBusy}>
+              {authBusy ? '処理中…' : authMode === 'login' ? 'ログイン' : '登録して開始'}
+            </button>
+          </form>
+          <button
+            className="auth-mode-toggle"
+            type="button"
+            disabled={authBusy}
+            onClick={() => {
+              setAuthError('')
+              setAuthMode((mode) => mode === 'login' ? 'register' : 'login')
+            }}
+          >
+            {authMode === 'login' ? '初めて利用する方はこちら（新規登録）' : '登録済みの方はこちら（ログイン）'}
+          </button>
+          <p className="auth-footnote">パスワードは暗号学的ハッシュとして保存されます。パスワード再設定機能はありません。</p>
+        </section>
+      </main>
+    )
+  }
 
   return (
     <main className="app-shell">
@@ -627,11 +831,19 @@ function App() {
             <div className="privacy-note"><ShieldCheck size={17} /><span>足跡はこの端末に保存されます。地図表示では地図配信元に表示範囲が伝わります。</span></div>
             <div className="settings-divider" />
             <div className="section-kicker">ACCOUNT & SYNC</div>
-            <h2>Google Driveと同期</h2>
-            <p className="muted-copy">記録はご自身のGoogleアカウントに紐づけて保存します。</p>
-            <button className="secondary-button full-button" onClick={signIn}><Cloud size={17} />Googleでログイン・同期</button>
-            <p className="small-muted">{hasSynced ? 'Googleアカウントに同期済み' : 'まだ同期されていません'}</p>
-            <div className="privacy-note"><CircleHelp size={17} /><span>写真・動画はスポットごとに、ご自身のGoogle Driveへ保存できます。</span></div>
+            <h2>ログイン中のアカウント</h2>
+            <p className="account-details"><strong>{account.name}</strong><span>{account.email}</span></p>
+            <button className="secondary-button full-button" onClick={() => void syncData()} disabled={syncing}>
+              <Cloud size={17} />{syncing ? '同期中…' : 'アカウントに同期'}
+            </button>
+            <p className="small-muted">{hasSynced ? 'スプレッドシートに同期済み' : 'まだ同期されていません'}</p>
+            <div className="privacy-note"><CircleHelp size={17} /><span>写真・動画ファイルはGoogle Driveに保存します。Drive連携はアカウントログインとは別に許可が必要です。</span></div>
+            {Capacitor.isNativePlatform() && (
+              <button className="secondary-button full-button" onClick={signIn}><Cloud size={17} />Google Driveを連携</button>
+            )}
+            <button className="text-button full-button" onClick={() => void logout()} disabled={authBusy}>
+              {authBusy ? '処理中…' : 'ログアウト'}
+            </button>
           </section>
         ) : (
           <>
@@ -685,8 +897,8 @@ function App() {
             <div className="sidebar-spacer" />
             <div className="sync-card">
               <div className="sync-card-icon"><Cloud size={18} /></div>
-              <div><strong>思い出を同期</strong><span>{identityToken ? 'Googleアカウントに保存できます' : 'Google Driveにバックアップ'}</span></div>
-              <button onClick={() => identityToken ? void syncData() : signIn()} disabled={syncing} aria-label="同期する"><Upload size={17} /></button>
+              <div><strong>思い出を同期</strong><span>{account.email}</span></div>
+              <button onClick={() => void syncData()} disabled={syncing} aria-label="同期する"><Upload size={17} /></button>
             </div>
             <div className="sidebar-footer"><span className="secure-dot" />あなたの思い出は、あなたのもの。</div>
           </>
@@ -699,7 +911,7 @@ function App() {
           <div className="breadcrumb"><span>マイアルバム</span><span className="breadcrumb-divider">/</span><strong>{tab === 'map' ? '足跡マップ' : tab === 'spots' ? 'お気に入り' : '記録の設定'}</strong></div>
           <div className="topbar-actions">
             <span className="location-label"><span className="location-pulse" />{active ? '位置情報を使用中' : 'GPS待機中'}</span>
-            <button className="avatar-button" onClick={signIn} aria-label="Googleアカウント">旅</button>
+            <button className="avatar-button" onClick={() => setTab('settings')} aria-label="アカウント設定">{account.name.slice(0, 1)}</button>
           </div>
         </header>
         <MapView points={data.points} memories={data.memories} active={active} onSelect={onSelectMemory} onAddPoint={onAddPoint} centerRequest={centerRequest} />
@@ -746,21 +958,6 @@ function App() {
           </div>
         )}
       </section>
-
-      {showGoogleLogin && (
-        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowGoogleLogin(false) }}>
-          <section className="save-dialog login-dialog" role="dialog" aria-modal="true" aria-labelledby="google-login-title">
-            <button type="button" className="dialog-close icon-button" onClick={() => setShowGoogleLogin(false)} aria-label="閉じる"><X size={18} /></button>
-            <div className="dialog-icon"><Cloud size={20} /></div>
-            <div className="section-kicker">BACK UP YOUR JOURNEY</div>
-            <h2 id="google-login-title">Googleアカウントに同期</h2>
-            <p>足跡とスポットをあなたのアカウントに保存します。写真・動画はご自身のGoogle Driveに保存されます。</p>
-            {CLIENT_ID
-              ? <div className="google-button-wrap">{googleReady ? <div ref={googleButtonRef} /> : <span className="small-muted">Googleログインを読み込み中…</span>}</div>
-              : <div className="privacy-note"><CircleHelp size={17} /><span>VITE_GOOGLE_CLIENT_IDを設定するとGoogleログインを利用できます。</span></div>}
-          </section>
-        </div>
-      )}
 
       {showSaveDialog && (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSaveDialog(false) }}>

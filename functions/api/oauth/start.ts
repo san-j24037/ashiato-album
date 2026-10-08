@@ -17,7 +17,7 @@ export const onRequestGet = ({ request, env }: { request: Request; env: Env }): 
     client_id: env.GOOGLE_CLIENT_ID,
     redirect_uri: env.GOOGLE_REDIRECT_URI,
     response_type: 'code',
-    scope: 'openid email profile https://www.googleapis.com/auth/drive.file',
+    scope: 'https://www.googleapis.com/auth/drive.file',
     state,
     access_type: 'online',
     prompt: 'select_account',

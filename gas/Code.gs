@@ -1,22 +1,48 @@
 const POINT_HEADERS = ['userSub', 'id', 'latitude', 'longitude', 'accuracy', 'recordedAt'];
 const MEMORY_HEADERS = ['userSub', 'id', 'title', 'note', 'latitude', 'longitude', 'createdAt', 'driveFiles'];
+const USER_HEADERS = [
+  'userId',
+  'email',
+  'displayName',
+  'passwordSalt',
+  'passwordHash',
+  'createdAt',
+  'lastLoginAt',
+  'failedAttempts',
+  'lockedUntil'
+];
+const MAX_LOGIN_FAILURES = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
 
 function doPost(event) {
   let lock;
   try {
     const body = JSON.parse(event.postData.contents || '{}');
-    const user = verifyIdentityToken(body.idToken);
+    verifyServiceKey(body.serviceKey);
     lock = LockService.getScriptLock();
     if (!lock.tryLock(10000)) {
       throw new Error('Database is busy. Please retry shortly');
     }
     const spreadsheet = getDatabase();
+    const usersSheet = getOrCreateSheet(spreadsheet, 'Users', USER_HEADERS);
+
+    if (body.action === 'accountRegister') {
+      return jsonResponse(registerAccount(usersSheet, body));
+    }
+    if (body.action === 'accountLookup') {
+      return jsonResponse(lookupAccount(usersSheet, body.email));
+    }
+    if (body.action === 'accountLoginFailure') {
+      return jsonResponse(recordLoginFailure(usersSheet, body.email));
+    }
+    if (body.action === 'accountLoginSuccess') {
+      return jsonResponse(recordLoginSuccess(usersSheet, body.email));
+    }
+
+    const user = verifySessionToken(body.sessionToken);
     const pointsSheet = getOrCreateSheet(spreadsheet, 'Points', POINT_HEADERS);
     const memoriesSheet = getOrCreateSheet(spreadsheet, 'Spots', MEMORY_HEADERS);
 
-    if (body.action === 'load') {
-      return jsonResponse({ ok: true, data: readUserData(user.sub, pointsSheet, memoriesSheet) });
-    }
     if (body.action !== 'sync') {
       throw new Error('Unsupported action');
     }
@@ -45,31 +71,174 @@ function doPost(event) {
   }
 }
 
-function verifyIdentityToken(idToken) {
-  if (typeof idToken !== 'string' || idToken.length < 20 || idToken.length > 5000) {
-    throw new Error('A valid Google sign-in is required');
+function verifyServiceKey(serviceKey) {
+  const expected = PropertiesService.getScriptProperties().getProperty('GAS_SERVICE_KEY');
+  if (!expected || !constantTimeEquals(String(serviceKey || ''), expected)) {
+    throw new Error('Request is not authorized');
   }
-  const expectedClientId = PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID');
-  if (!expectedClientId) {
-    throw new Error('Set the GOOGLE_CLIENT_ID script property before using sync');
+}
+
+function verifySessionToken(token) {
+  const secret = PropertiesService.getScriptProperties().getProperty('APP_SESSION_SECRET');
+  if (!secret || typeof token !== 'string' || token.length > 4096) {
+    throw new Error('A valid account session is required');
+  }
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Account session is invalid');
+  let header;
+  try {
+    header = JSON.parse(
+      Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[0])).getDataAsString()
+    );
+  } catch (error) {
+    throw new Error('Account session is invalid');
+  }
+  if (!header || header.alg !== 'HS256' || header.typ !== 'JWT') {
+    throw new Error('Account session is invalid');
+  }
+  const content = parts[0] + '.' + parts[1];
+  const expectedSignature = Utilities.base64EncodeWebSafe(
+    Utilities.computeHmacSha256Signature(content, secret)
+  ).replace(/=+$/g, '');
+  if (!constantTimeEquals(parts[2], expectedSignature)) {
+    throw new Error('Account session is invalid');
   }
 
-  const response = UrlFetchApp.fetch(
-    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken),
-    { muteHttpExceptions: true }
-  );
-  if (response.getResponseCode() !== 200) {
-    throw new Error('Google sign-in could not be verified');
+  let claims;
+  try {
+    claims = JSON.parse(
+      Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[1])).getDataAsString()
+    );
+  } catch (error) {
+    throw new Error('Account session is invalid');
+  }
+  const now = Date.now() / 1000;
+  if (
+    !claims ||
+    typeof claims.sub !== 'string' ||
+    !/^[a-f0-9-]{36}$/i.test(claims.sub) ||
+    typeof claims.email !== 'string' ||
+    typeof claims.name !== 'string' ||
+    !Number.isFinite(claims.exp) ||
+    claims.exp <= now ||
+    !Number.isFinite(claims.iat) ||
+    claims.iat > now + 60
+  ) {
+    throw new Error('Account session is invalid or expired');
+  }
+  return { sub: claims.sub, email: claims.email, name: claims.name };
+}
+
+function constantTimeEquals(actual, expected) {
+  if (typeof actual !== 'string' || typeof expected !== 'string' || actual.length !== expected.length) {
+    return false;
+  }
+  let difference = 0;
+  for (let index = 0; index < actual.length; index += 1) {
+    difference |= actual.charCodeAt(index) ^ expected.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+function registerAccount(sheet, body) {
+  const account = body.account;
+  if (
+    !account ||
+    typeof account.id !== 'string' ||
+    !/^[a-f0-9-]{36}$/i.test(account.id) ||
+    typeof account.name !== 'string' ||
+    account.name.length < 1 ||
+    account.name.length > 80 ||
+    /[\u0000-\u001f\u007f]/.test(account.name) ||
+    !isValidEmail(account.email) ||
+    !/^[A-Za-z0-9_-]{22}$/.test(body.passwordSalt || '') ||
+    !/^[A-Za-z0-9_-]{43}$/.test(body.passwordHash || '')
+  ) {
+    throw new Error('Registration data is invalid');
   }
 
-  const claims = JSON.parse(response.getContentText());
-  if (claims.aud !== expectedClientId || !claims.sub || Number(claims.exp) <= Date.now() / 1000) {
-    throw new Error('Google sign-in token is invalid or expired');
+  const email = account.email.trim().toLowerCase();
+  const rows = readSheet(sheet);
+  if (rows.slice(1).some(row => String(row[1]).trim().toLowerCase() === email)) {
+    return { ok: false, code: 'EMAIL_EXISTS' };
   }
-  if (claims.email_verified !== 'true') {
-    throw new Error('A verified Google account is required');
+  appendRows(sheet, [[
+    account.id,
+    email,
+    account.name.trim(),
+    body.passwordSalt,
+    body.passwordHash,
+    new Date(),
+    '',
+    0,
+    0
+  ]]);
+  return { ok: true };
+}
+
+function lookupAccount(sheet, emailValue) {
+  if (!isValidEmail(emailValue)) throw new Error('Email is invalid');
+  const email = emailValue.trim().toLowerCase();
+  const rows = readSheet(sheet);
+  const row = rows.slice(1).find(item => String(item[1]).trim().toLowerCase() === email);
+  if (!row) return { ok: true, user: null };
+  return {
+    ok: true,
+    user: {
+      userId: String(row[0]),
+      email: String(row[1]),
+      displayName: String(row[2]),
+      passwordSalt: String(row[3]),
+      passwordHash: String(row[4]),
+      failedAttempts: Number(row[7]) || 0,
+      lockedUntil: toTimestamp(row[8])
+    }
+  };
+}
+
+function recordLoginFailure(sheet, emailValue) {
+  const user = findUserRow(sheet, emailValue);
+  if (!user) return { ok: true };
+  const now = Date.now();
+  let failures = Number(user.values[7]) || 0;
+  let lockedUntil = toTimestamp(user.values[8]);
+  if (lockedUntil <= now) {
+    if (failures >= MAX_LOGIN_FAILURES) failures = 0;
+    lockedUntil = 0;
   }
-  return { sub: String(claims.sub) };
+  failures += 1;
+  if (failures >= MAX_LOGIN_FAILURES) lockedUntil = now + LOGIN_LOCK_MS;
+  sheet.getRange(user.row, 8, 1, 2).setValues([[failures, lockedUntil]]);
+  return { ok: true };
+}
+
+function recordLoginSuccess(sheet, emailValue) {
+  const user = findUserRow(sheet, emailValue);
+  if (!user || toTimestamp(user.values[8]) > Date.now()) {
+    throw new Error('Account is unavailable');
+  }
+  sheet.getRange(user.row, 7, 1, 3).setValues([[new Date(), 0, 0]]);
+  return { ok: true };
+}
+
+function findUserRow(sheet, emailValue) {
+  if (!isValidEmail(emailValue)) return null;
+  const email = emailValue.trim().toLowerCase();
+  const rows = readSheet(sheet);
+  const index = rows.slice(1).findIndex(row => String(row[1]).trim().toLowerCase() === email);
+  return index < 0 ? null : { row: index + 2, values: rows[index + 1] };
+}
+
+function isValidEmail(value) {
+  return typeof value === 'string' &&
+    value.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function toTimestamp(value) {
+  if (value instanceof Date) return value.getTime();
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
 }
 
 function getDatabase() {

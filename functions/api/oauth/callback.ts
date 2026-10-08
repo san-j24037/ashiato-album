@@ -29,14 +29,13 @@ export const onRequestGet = async ({ request, env }: { request: Request; env: En
         grant_type: 'authorization_code',
       }),
     })
-    const token = (await response.json()) as { id_token?: string; access_token?: string; expires_in?: number; error?: string }
-    if (!response.ok || !token.id_token || !token.access_token || !token.expires_in) {
+    const token = (await response.json()) as { access_token?: string; expires_in?: number; error?: string }
+    if (!response.ok || !token.access_token || !token.expires_in) {
       console.error('Google OAuth code exchange failed', token.error ?? response.status)
       return redirectToApp({ state, error: 'Google token exchange failed' })
     }
     return redirectToApp({
       state,
-      id_token: token.id_token,
       access_token: token.access_token,
       expires_in: String(token.expires_in),
     })
