@@ -14,6 +14,7 @@ import {
   Crosshair,
   Eye,
   EyeOff,
+  FileUp,
   Footprints,
   Heart,
   Image,
@@ -34,10 +35,11 @@ import {
   Video,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
+import { parseTimelinePoints } from './timeline-import'
 import { emptyAppData, type AppData, type Memory, type PublicMemory, type TrackPoint } from './types'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
@@ -102,6 +104,47 @@ function readMapStyle(): MapStyle {
   return savedStyle === 'terrain' || savedStyle === 'satellite' ? savedStyle : 'standard'
 }
 
+function updateSatelliteColorMask(map: L.Map, layer: L.TileLayer, points: TrackPoint[]) {
+  const container = layer.getContainer()
+  if (!container) return
+
+  const mapBounds = map.getContainer().getBoundingClientRect()
+  const circles = points.map((point) => {
+    const center = map.latLngToContainerPoint([point.latitude, point.longitude])
+    const targetLatitude = point.latitude > 89.999
+      ? point.latitude - 20 / 111_320
+      : point.latitude + 20 / 111_320
+    const edge = map.latLngToContainerPoint([targetLatitude, point.longitude])
+    const radius = Math.max(Math.hypot(edge.x - center.x, edge.y - center.y), 0.5)
+    return {
+      x: mapBounds.left + center.x,
+      y: mapBounds.top + center.y,
+      radius,
+    }
+  })
+
+  container.querySelectorAll<HTMLImageElement>('.leaflet-tile').forEach((tile) => {
+    const tileBounds = tile.getBoundingClientRect()
+    const width = Math.max(tile.clientWidth, 1)
+    const height = Math.max(tile.clientHeight, 1)
+    const tileCircles = circles
+      .filter((circle) => (
+        circle.x + circle.radius >= tileBounds.left
+        && circle.x - circle.radius <= tileBounds.right
+        && circle.y + circle.radius >= tileBounds.top
+        && circle.y - circle.radius <= tileBounds.bottom
+      ))
+      .map((circle) => (
+        `<circle cx="${(circle.x - tileBounds.left).toFixed(2)}" cy="${(circle.y - tileBounds.top).toFixed(2)}" r="${circle.radius.toFixed(2)}" fill="white"/>`
+      ))
+      .join('')
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${tileCircles}</svg>`
+    const mask = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`
+    tile.style.setProperty('mask-image', mask)
+    tile.style.setProperty('-webkit-mask-image', mask)
+  })
+}
+
 function MapView({
   points,
   memories,
@@ -136,6 +179,7 @@ function MapView({
   const elementRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
+  const satelliteColorLayerRef = useRef<L.TileLayer | null>(null)
   const layerRef = useRef<L.LayerGroup | null>(null)
   const userMarkerRef = useRef<L.CircleMarker | null>(null)
   const searchMarkerRef = useRef<L.Marker | null>(null)
@@ -143,6 +187,12 @@ function MapView({
   const pointsRef = useRef(points)
   const [mapStyle, setMapStyle] = useState<MapStyle>(readMapStyle)
   const [searchQuery, setSearchQuery] = useState('')
+  const showTrackMarkings = active
+    && !searchQuery.trim()
+    && !searching
+    && !searchError
+    && searchResults.length === 0
+    && !selectedSearchResult
 
   useEffect(() => {
     if (!elementRef.current) return
@@ -166,6 +216,7 @@ function MapView({
       map.remove()
       mapRef.current = null
       tileLayerRef.current = null
+      satelliteColorLayerRef.current = null
       layerRef.current = null
     }
   }, [onAddPoint])
@@ -174,6 +225,10 @@ function MapView({
     const map = mapRef.current
     if (!map) return
     tileLayerRef.current?.remove()
+    satelliteColorLayerRef.current?.remove()
+    satelliteColorLayerRef.current = null
+    const satellite = mapStyle === 'satellite'
+    const highlightSatellite = satellite && showTrackMarkings
     const tileLayer = mapStyle === 'standard'
       ? L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
           maxZoom: 19,
@@ -188,12 +243,36 @@ function MapView({
         : L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
             maxZoom: 19,
             maxNativeZoom: 17,
+            className: highlightSatellite ? 'satellite-muted-layer' : '',
             attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
           })
     tileLayer.addTo(map)
     tileLayerRef.current = tileLayer
+    if (highlightSatellite) {
+      const colorLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: 19,
+        maxNativeZoom: 17,
+        className: 'satellite-color-layer',
+      }).addTo(map)
+      satelliteColorLayerRef.current = colorLayer
+    }
     localStorage.setItem(MAP_STYLE_KEY, mapStyle)
-  }, [mapStyle])
+  }, [mapStyle, showTrackMarkings])
+
+  useEffect(() => {
+    const map = mapRef.current
+    const colorLayer = satelliteColorLayerRef.current
+    if (!map || !colorLayer || !showTrackMarkings) return
+
+    const updateMask = () => updateSatelliteColorMask(map, colorLayer, points)
+    updateMask()
+    map.on('moveend zoomend resize', updateMask)
+    colorLayer.on('tileload', updateMask)
+    return () => {
+      map.off('moveend zoomend resize', updateMask)
+      colorLayer.off('tileload', updateMask)
+    }
+  }, [points, mapStyle, showTrackMarkings])
 
   useEffect(() => {
     pointsRef.current = points
@@ -211,6 +290,16 @@ function MapView({
       }).addTo(layers)
     }
     for (const point of points) {
+      if (showTrackMarkings && mapStyle !== 'satellite') {
+        L.circle([point.latitude, point.longitude], {
+          radius: 20,
+          color: '#397a69',
+          weight: 1,
+          opacity: 0.8,
+          fillColor: '#397a69',
+          fillOpacity: 0.16,
+        }).addTo(layers)
+      }
       L.circleMarker([point.latitude, point.longitude], {
         radius: 5,
         color: '#fff',
@@ -267,7 +356,7 @@ function MapView({
       map.setView([latest.latitude, latest.longitude], Math.max(map.getZoom(), 14), { animate: true })
       lastCenteredIdRef.current = latest.id
     }
-  }, [points, memories, recommendations, onSelect, onSelectRecommendation])
+  }, [points, memories, recommendations, onSelect, onSelectRecommendation, mapStyle, showTrackMarkings])
 
   useEffect(() => {
     if (centerRequest && mapRef.current) mapRef.current.setView(centerRequest, Math.max(mapRef.current.getZoom(), 14))
@@ -420,9 +509,11 @@ function App() {
   const [selectedSearchResult, setSelectedSearchResult] = useState<PlaceSearchResult | null>(null)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
+  const [importingTimeline, setImportingTimeline] = useState(false)
   const searchAbortRef = useRef<AbortController | null>(null)
   const lastSearchRequestAtRef = useRef(0)
   const mediaInputRef = useRef<HTMLInputElement>(null)
+  const timelineInputRef = useRef<HTMLInputElement>(null)
   const webWatchId = useRef<number | null>(null)
   const intervalRef = useRef(intervalSeconds)
   const lastAcceptedTimeRef = useRef(0)
@@ -968,6 +1059,58 @@ function App() {
     }
   }
 
+  const importTimeline = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.json')) {
+      setMessage('JSON形式のタイムラインファイルを選択してください')
+      return
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      setMessage('ファイルは50MB以下のJSONを選択してください')
+      return
+    }
+
+    setImportingTimeline(true)
+    setMessage('')
+    try {
+      let parsedJson: unknown
+      try {
+        parsedJson = JSON.parse(await file.text()) as unknown
+      } catch {
+        throw new Error('JSONファイルを読み取れません。ファイルの内容を確認してください')
+      }
+
+      const importedPoints = parseTimelinePoints(parsedJson)
+      const pointKey = (point: TrackPoint) => (
+        `${point.recordedAt}|${point.latitude.toFixed(7)}|${point.longitude.toFixed(7)}`
+      )
+      const existingKeys = new Set(data.points.map(pointKey))
+      const newPoints = importedPoints.filter((point) => !existingKeys.has(pointKey(point)))
+      if (!newPoints.length) {
+        setMessage('読み込んだGPS地点はすべて登録済みです')
+        return
+      }
+
+      setData((current) => ({
+        ...current,
+        points: [...current.points, ...newPoints].sort(
+          (left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt),
+        ),
+      }))
+      const latestImportedPoint = newPoints[newPoints.length - 1]
+      setCenterRequest([latestImportedPoint.latitude, latestImportedPoint.longitude])
+      setTab('map')
+      setMessage(`${newPoints.length.toLocaleString()}件のGPS地点を追加しました。端末に保存されています`)
+    } catch (error) {
+      console.error('タイムラインを読み込めませんでした。', error)
+      setMessage(error instanceof Error ? error.message : 'タイムラインを読み込めませんでした')
+    } finally {
+      setImportingTimeline(false)
+    }
+  }
+
   if (!authReady) {
     return (
       <main className="auth-shell">
@@ -1125,6 +1268,26 @@ function App() {
               ))}
             </div>
             <div className="privacy-note"><ShieldCheck size={17} /><span>足跡はこの端末に保存されます。地図表示では地図配信元に表示範囲が伝わります。</span></div>
+            <div className="settings-divider" />
+            <div className="section-kicker">IMPORT TIMELINE</div>
+            <h2>タイムラインをインポート</h2>
+            <p className="muted-copy">Google MapsのタイムラインJSONからGPS地点を追加します。既存の地点は重複登録されません。</p>
+            <input
+              ref={timelineInputRef}
+              className="visually-hidden"
+              type="file"
+              accept=".json,application/json"
+              onChange={(event) => void importTimeline(event)}
+              aria-label="タイムラインJSONファイル"
+            />
+            <button
+              className="secondary-button full-button"
+              onClick={() => timelineInputRef.current?.click()}
+              disabled={importingTimeline}
+            >
+              <FileUp size={17} />{importingTimeline ? '読み込み中…' : 'JSONファイルを選択'}
+            </button>
+            <p className="small-muted">読み込んだ地点は端末に保存されます。別端末で使うには、インポート後にアカウントへ同期してください。</p>
             <div className="settings-divider" />
             <div className="section-kicker">ACCOUNT & SYNC</div>
             <h2>ログイン中のアカウント</h2>

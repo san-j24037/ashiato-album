@@ -553,6 +553,17 @@
   font-family: "Noto Sans JP", sans-serif;
 }
 
+.satellite-muted-layer .leaflet-tile {
+  filter: grayscale(1) opacity(0.72);
+}
+
+.satellite-color-layer .leaflet-tile {
+  mask-repeat: no-repeat;
+  mask-size: 100% 100%;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+}
+
 .leaflet-control-attribution {
   margin: 0 12px 84px 0 !important;
   padding: 2px 5px !important;
@@ -1198,6 +1209,16 @@
   color: #9aa59d;
   font-size: 9px;
   text-align: center;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
 }
 
 .modal-backdrop {
