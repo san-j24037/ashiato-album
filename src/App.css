@@ -584,6 +584,183 @@
   line-height: 31px !important;
 }
 
+.map-search {
+  position: absolute;
+  z-index: 3;
+  top: 83px;
+  left: 21px;
+  width: min(360px, calc(100% - 42px));
+}
+
+.map-search-form {
+  display: flex;
+  height: 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 7px 0 12px;
+  color: #748078;
+  border: 1px solid #e8ede8;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 3px 14px #253b3416;
+}
+
+.map-search-form input {
+  width: 0;
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  color: #40534a;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+}
+
+.map-search-form input::placeholder {
+  color: #a0aaa4;
+}
+
+.map-search-form button {
+  min-width: 52px;
+  height: 32px;
+  padding: 0 9px;
+  color: #fff;
+  border: 0;
+  border-radius: 7px;
+  background: #3f7e6b;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.map-search-form button:disabled {
+  opacity: .6;
+  cursor: wait;
+}
+
+.map-search-results {
+  display: grid;
+  max-height: min(360px, calc(100svh - 150px));
+  gap: 2px;
+  margin-top: 6px;
+  overflow-y: auto;
+  padding: 5px;
+  border: 1px solid #e8ede8;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 5px 18px #253b3418;
+}
+
+.search-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px;
+  color: #648071;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.search-result:hover,
+.search-result.selected {
+  background: #f0f6f1;
+}
+
+.search-result > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.search-result > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.search-result strong,
+.search-result small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.search-result strong {
+  color: #40534a;
+  font-size: 10px;
+}
+
+.search-result small {
+  color: #89968e;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.search-status {
+  margin: 7px;
+  color: #748078;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.search-status.is-error {
+  color: #a34f45;
+}
+
+.search-attribution {
+  padding: 5px 8px 3px;
+  color: #929e96;
+  font-size: 8px;
+}
+
+.search-marker {
+  border: 0;
+  background: transparent;
+}
+
+.search-marker span {
+  position: relative;
+  display: block;
+  width: 36px;
+  height: 36px;
+  border: 3px solid #fff;
+  border-radius: 50% 50% 50% 4px;
+  background: #397a69;
+  box-shadow: 0 3px 10px #253b3450;
+  transform: rotate(-45deg);
+}
+
+.search-marker i {
+  position: absolute;
+  top: 9px;
+  left: 9px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.search-marker-popup {
+  display: grid;
+  max-width: 240px;
+  gap: 4px;
+}
+
+.search-marker-popup strong {
+  color: #344a3f;
+  font-size: 11px;
+}
+
+.search-marker-popup span {
+  color: #748279;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
 .memory-marker {
   border: 0;
   background: transparent;
@@ -629,7 +806,7 @@
 .map-status {
   position: absolute;
   z-index: 1;
-  top: 83px;
+  top: 139px;
   left: 21px;
   display: flex;
   align-items: center;
@@ -874,6 +1051,20 @@
 
 .recommendation-kicker {
   color: #568b75;
+}
+
+.search-place-detail {
+  top: 140px;
+}
+
+.search-place-kicker {
+  color: #397a69;
+}
+
+.search-place-source {
+  margin-bottom: 0 !important;
+  color: #929e96 !important;
+  font-size: 9px !important;
 }
 
 .memory-detail h2 {
@@ -1401,19 +1592,33 @@
   }
 
   .map-status {
-    top: 70px;
+    top: 127px;
     left: 12px;
   }
 
   .map-hint {
-    top: 117px;
+    top: 220px;
     right: 12px;
     gap: 5px;
     padding: 8px;
   }
 
-  .map-style-switch {
+  .map-search {
     top: 70px;
+    left: 12px;
+    width: min(360px, calc(100% - 24px));
+  }
+
+  .map-search-form {
+    height: 42px;
+  }
+
+  .map-search-results {
+    max-height: min(300px, calc(100svh - 135px));
+  }
+
+  .map-style-switch {
+    top: 174px;
     right: 12px;
   }
 
@@ -1469,6 +1674,10 @@
     top: 70px;
     right: 12px;
     width: min(300px, calc(100% - 24px));
+  }
+
+  .search-place-detail {
+    top: 132px;
   }
 
   .toast-message {

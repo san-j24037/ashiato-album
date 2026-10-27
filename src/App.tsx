@@ -26,6 +26,7 @@ import {
   Pause,
   Play,
   Plus,
+  Search,
   Settings2,
   ShieldCheck,
   Sparkles,
@@ -54,6 +55,42 @@ type Tab = 'map' | 'spots' | 'settings'
 type MapStyle = 'standard' | 'terrain' | 'satellite'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData; recommendations?: PublicMemory[] }
 type AccountProfile = { id: string; name: string; email: string }
+type PlaceSearchResult = {
+  id: string
+  latitude: number
+  longitude: number
+  name: string
+  address: string
+  category: string
+}
+
+function parsePlaceSearchResults(value: unknown): PlaceSearchResult[] {
+  if (!Array.isArray(value)) throw new Error('場所の検索結果を読み取れませんでした')
+  return value.flatMap((item: unknown) => {
+    if (!item || typeof item !== 'object') return []
+    const place = item as Record<string, unknown>
+    const latitude = Number(place.lat)
+    const longitude = Number(place.lon)
+    if (
+      !Number.isFinite(latitude) || latitude < -90 || latitude > 90
+      || !Number.isFinite(longitude) || longitude < -180 || longitude > 180
+      || typeof place.display_name !== 'string'
+    ) return []
+    const address = place.display_name
+    const name = typeof place.name === 'string' && place.name ? place.name : address.split(',')[0].trim()
+    const category = [place.class, place.type]
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
+      .join(' / ')
+    return [{
+      id: String(place.place_id ?? `${latitude},${longitude}`),
+      latitude,
+      longitude,
+      name,
+      address,
+      category,
+    }]
+  })
+}
 
 function readInterval() {
   const value = Number(localStorage.getItem(INTERVAL_KEY))
@@ -74,6 +111,12 @@ function MapView({
   onSelectRecommendation,
   onAddPoint,
   centerRequest,
+  searchResults,
+  selectedSearchResult,
+  searching,
+  searchError,
+  onSearch,
+  onChooseSearchResult,
 }: {
   points: TrackPoint[]
   memories: Memory[]
@@ -83,15 +126,23 @@ function MapView({
   onSelectRecommendation(memory: PublicMemory): void
   onAddPoint(point: TrackPoint): void
   centerRequest: [number, number] | null
+  searchResults: PlaceSearchResult[]
+  selectedSearchResult: PlaceSearchResult | null
+  searching: boolean
+  searchError: string
+  onSearch(query: string): void
+  onChooseSearchResult(result: PlaceSearchResult): void
 }) {
   const elementRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const layerRef = useRef<L.LayerGroup | null>(null)
   const userMarkerRef = useRef<L.CircleMarker | null>(null)
+  const searchMarkerRef = useRef<L.Marker | null>(null)
   const lastCenteredIdRef = useRef<string | null>(null)
   const pointsRef = useRef(points)
   const [mapStyle, setMapStyle] = useState<MapStyle>(readMapStyle)
+  const [searchQuery, setSearchQuery] = useState('')
 
   useEffect(() => {
     if (!elementRef.current) return
@@ -221,9 +272,71 @@ function MapView({
     if (centerRequest && mapRef.current) mapRef.current.setView(centerRequest, Math.max(mapRef.current.getZoom(), 14))
   }, [centerRequest])
 
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    searchMarkerRef.current?.remove()
+    searchMarkerRef.current = null
+    if (!selectedSearchResult) return
+
+    const location = selectedSearchResult
+    const icon = L.divIcon({
+      className: 'search-marker',
+      html: '<span><i></i></span>',
+      iconSize: [42, 48],
+      iconAnchor: [21, 44],
+    })
+    const popupContent = L.DomUtil.create('div', 'search-marker-popup')
+    const title = L.DomUtil.create('strong', '', popupContent)
+    title.textContent = location.name
+    const address = L.DomUtil.create('span', '', popupContent)
+    address.textContent = location.address
+    searchMarkerRef.current = L.marker([location.latitude, location.longitude], { icon })
+      .bindPopup(popupContent)
+      .addTo(map)
+    map.flyTo([location.latitude, location.longitude], 17, { duration: 0.8 })
+  }, [selectedSearchResult])
+
   return (
     <div className="map-canvas">
       <div ref={elementRef} className="leaflet-map" aria-label="訪れた場所の地図" />
+      <div className="map-search">
+        <form className="map-search-form" onSubmit={(event) => {
+          event.preventDefault()
+          onSearch(searchQuery)
+        }}>
+          <Search size={17} aria-hidden="true" />
+          <input
+            type="search"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="場所の名前・住所を検索"
+            aria-label="場所の名前または住所"
+            maxLength={200}
+          />
+          <button type="submit" disabled={searching || !searchQuery.trim()} aria-label="検索">
+            {searching ? '検索中…' : '検索'}
+          </button>
+        </form>
+        {(searching || searchError || searchResults.length > 0) && (
+          <div className="map-search-results" aria-live="polite">
+            {searching && <p className="search-status">場所を検索しています…</p>}
+            {searchError && <p className="search-status is-error" role="status">{searchError}</p>}
+            {searchResults.map((result) => (
+              <button
+                type="button"
+                className={`search-result ${selectedSearchResult?.id === result.id ? 'selected' : ''}`}
+                key={result.id}
+                onClick={() => onChooseSearchResult(result)}
+              >
+                <MapPin size={16} />
+                <span><strong>{result.name}</strong><small>{result.address}</small></span>
+              </button>
+            ))}
+            <small className="search-attribution">検索結果 © OpenStreetMap contributors</small>
+          </div>
+        )}
+      </div>
       <div className={`map-status ${active ? 'is-recording' : ''}`}>
         <span className="status-dot" />
         {active ? '足跡を記録中' : '記録は停止中'}
@@ -302,6 +415,12 @@ function App() {
   const [hasSynced, setHasSynced] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [centerRequest, setCenterRequest] = useState<[number, number] | null>(null)
+  const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([])
+  const [selectedSearchResult, setSelectedSearchResult] = useState<PlaceSearchResult | null>(null)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const searchAbortRef = useRef<AbortController | null>(null)
+  const lastSearchRequestAtRef = useRef(0)
   const mediaInputRef = useRef<HTMLInputElement>(null)
   const webWatchId = useRef<number | null>(null)
   const intervalRef = useRef(intervalSeconds)
@@ -791,11 +910,62 @@ function App() {
   useEffect(() => () => {
     if (webWatchId.current !== null) navigator.geolocation.clearWatch(webWatchId.current)
     if (nativeWatcherRef.current) void BackgroundGeolocation.removeWatcher({ id: nativeWatcherRef.current })
+    searchAbortRef.current?.abort()
   }, [])
 
   const recentMemories = useMemo(() => [...data.memories].reverse(), [data.memories])
   const pointForSpot = selectedPoint ?? data.points[data.points.length - 1]
   const latestDate = data.points.at(-1)?.recordedAt
+
+  const searchPlaces = async (query: string) => {
+    const normalizedQuery = query.trim()
+    if (normalizedQuery.length < 2) {
+      setSearchError('場所の名前または住所を2文字以上入力してください')
+      setSearchResults([])
+      setSelectedSearchResult(null)
+      return
+    }
+    if (Date.now() - lastSearchRequestAtRef.current < 1000) {
+      setSearchError('検索は1秒以上間隔をあけてお試しください')
+      return
+    }
+    searchAbortRef.current?.abort()
+    const controller = new AbortController()
+    searchAbortRef.current = controller
+    lastSearchRequestAtRef.current = Date.now()
+    setSearching(true)
+    setSearchError('')
+    setSearchResults([])
+    setSelectedSearchResult(null)
+    try {
+      const params = new URLSearchParams({
+        q: normalizedQuery,
+        format: 'jsonv2',
+        addressdetails: '1',
+        limit: '5',
+        'accept-language': 'ja',
+      })
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        if (response.status === 429) throw new Error('検索が混み合っています。少し待ってから再度お試しください')
+        throw new Error(`場所を検索できませんでした (${response.status})`)
+      }
+      const results = parsePlaceSearchResults(await response.json())
+      if (controller.signal.aborted) return
+      setSearchResults(results)
+      setSelectedSearchResult(results[0] ?? null)
+      if (!results.length) setSearchError('場所が見つかりませんでした。別の名前や住所で検索してください')
+    } catch (error) {
+      if (controller.signal.aborted) return
+      console.error('場所を検索できませんでした。', error)
+      setSearchError(error instanceof Error ? error.message : '場所を検索できませんでした。ネットワークを確認してください')
+    } finally {
+      if (!controller.signal.aborted) setSearching(false)
+    }
+  }
 
   if (!authReady) {
     return (
@@ -1048,6 +1218,12 @@ function App() {
           onSelectRecommendation={onSelectRecommendation}
           onAddPoint={onAddPoint}
           centerRequest={centerRequest}
+          searchResults={searchResults}
+          selectedSearchResult={selectedSearchResult}
+          searching={searching}
+          searchError={searchError}
+          onSearch={searchPlaces}
+          onChooseSearchResult={setSelectedSearchResult}
         />
         <div className="map-actions">
           <button className="floating-button locate-button" onClick={() => {
@@ -1114,6 +1290,23 @@ function App() {
             {selectedRecommendation.note && <p>{selectedRecommendation.note}</p>}
             <div className="detail-coordinate">{selectedRecommendation.latitude.toFixed(5)}°, {selectedRecommendation.longitude.toFixed(5)}°</div>
             <p className="recommendation-owner">おすすめした人：{selectedRecommendation.ownerName}</p>
+          </div>
+        )}
+        {selectedSearchResult && (
+          <div className="memory-detail search-place-detail">
+            <button className="detail-close icon-button" onClick={() => {
+              setSelectedSearchResult(null)
+              setSearchResults([])
+              setSearchError('')
+            }} aria-label="閉じる"><X size={18} /></button>
+            <div className="detail-kicker search-place-kicker"><MapPin size={14} /> SEARCH RESULT</div>
+            <h2>{selectedSearchResult.name}</h2>
+            <p>{selectedSearchResult.address}</p>
+            {selectedSearchResult.category && <p>場所の種類：{selectedSearchResult.category}</p>}
+            <div className="detail-coordinate">
+              {selectedSearchResult.latitude.toFixed(5)}°, {selectedSearchResult.longitude.toFixed(5)}°
+            </div>
+            <p className="search-place-source">場所情報：OpenStreetMap contributors</p>
           </div>
         )}
       </section>
