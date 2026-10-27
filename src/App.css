@@ -607,6 +607,25 @@
   transform: rotate(45deg);
 }
 
+.recommendation-marker {
+  border: 0;
+  background: transparent;
+}
+
+.recommendation-marker span {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  color: #fff;
+  border: 3px solid #fff;
+  border-radius: 50% 50% 50% 4px;
+  background: #568b75;
+  box-shadow: 0 3px 9px #404c3c46;
+  font-size: 15px;
+  transform: rotate(-45deg);
+}
+
 .map-status {
   position: absolute;
   z-index: 1;
@@ -828,6 +847,8 @@
   top: 83px;
   right: 20px;
   width: min(300px, calc(100% - 40px));
+  max-height: calc(100% - 105px);
+  overflow-y: auto;
   padding: 19px;
   border: 1px solid #e5ebe5;
   border-radius: 13px;
@@ -851,6 +872,10 @@
   letter-spacing: 1.1px;
 }
 
+.recommendation-kicker {
+  color: #568b75;
+}
+
 .memory-detail h2 {
   margin: 10px 0 5px;
   color: #344a3f;
@@ -863,6 +888,52 @@
   color: #748279;
   font-size: 10px;
   line-height: 1.7;
+}
+
+.spot-detail-form .field-label {
+  margin: 10px 0 5px;
+}
+
+.spot-detail-form .text-field {
+  padding: 8px 9px;
+}
+
+.spot-detail-form .primary-button {
+  margin-top: 12px;
+}
+
+.visibility-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 14px;
+  color: #5b7063;
+  cursor: pointer;
+}
+
+.visibility-option input {
+  margin: 2px 0 0;
+  accent-color: #3f7e6b;
+}
+
+.visibility-option span {
+  display: grid;
+  gap: 3px;
+}
+
+.visibility-option strong {
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.visibility-option small {
+  color: #98a39b;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.recommendation-owner {
+  margin-top: 12px !important;
 }
 
 .detail-coordinate {

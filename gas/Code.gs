@@ -1,5 +1,17 @@
 const POINT_HEADERS = ['userSub', 'id', 'latitude', 'longitude', 'accuracy', 'recordedAt'];
-const MEMORY_HEADERS = ['userSub', 'id', 'title', 'note', 'latitude', 'longitude', 'createdAt', 'driveFiles'];
+const MEMORY_HEADERS = [
+  'userSub',
+  'id',
+  'title',
+  'note',
+  'latitude',
+  'longitude',
+  'createdAt',
+  'driveFiles',
+  'address',
+  'isPublic',
+  'ownerName'
+];
 const USER_HEADERS = [
   'userId',
   'email',
@@ -61,8 +73,12 @@ function doPost(event) {
     }
 
     mergePoints(user.sub, pointsSheet, points);
-    mergeMemories(user.sub, memoriesSheet, memories);
-    return jsonResponse({ ok: true, data: readUserData(user.sub, pointsSheet, memoriesSheet) });
+    mergeMemories(user.sub, memoriesSheet, memories, user.name);
+    return jsonResponse({
+      ok: true,
+      data: readUserData(user.sub, pointsSheet, memoriesSheet),
+      recommendations: readPublicMemories(user.sub, memoriesSheet)
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unexpected server error';
     return jsonResponse({ ok: false, error: message });
@@ -256,6 +272,20 @@ function getOrCreateSheet(spreadsheet, name, headers) {
     sheet.appendRow(headers);
   } else if (sheet.getLastRow() === 0) {
     sheet.appendRow(headers);
+  } else {
+    const columnCount = sheet.getLastColumn();
+    const existingHeaders = columnCount
+      ? sheet.getRange(1, 1, 1, columnCount).getValues()[0]
+      : [];
+    for (let index = 0; index < existingHeaders.length; index += 1) {
+      if (existingHeaders[index] !== headers[index]) {
+        throw new Error('Unexpected columns in the ' + name + ' sheet');
+      }
+    }
+    if (existingHeaders.length < headers.length) {
+      sheet.getRange(1, existingHeaders.length + 1, 1, headers.length - existingHeaders.length)
+        .setValues([headers.slice(existingHeaders.length)]);
+    }
   }
   return sheet;
 }
@@ -274,7 +304,7 @@ function mergePoints(userSub, sheet, points) {
   appendRows(sheet, rows);
 }
 
-function mergeMemories(userSub, sheet, memories) {
+function mergeMemories(userSub, sheet, memories, ownerName) {
   const rows = readSheet(sheet);
   const rowById = new Map();
   rows.slice(1).forEach((row, index) => {
@@ -290,7 +320,10 @@ function mergeMemories(userSub, sheet, memories) {
       memory.latitude,
       memory.longitude,
       memory.createdAt,
-      JSON.stringify(Array.isArray(memory.driveFiles) ? memory.driveFiles : [])
+      JSON.stringify(Array.isArray(memory.driveFiles) ? memory.driveFiles : []),
+      memory.address || '',
+      memory.isPublic === true,
+      ownerName
     ];
     const existingRow = rowById.get(memory.id);
     if (existingRow) {
@@ -321,9 +354,28 @@ function readUserData(userSub, pointsSheet, memoriesSheet) {
       latitude: Number(row[4]),
       longitude: Number(row[5]),
       createdAt: toIsoString(row[6]),
-      driveFiles: parseDriveFiles(row[7])
+      driveFiles: parseDriveFiles(row[7]),
+      address: String(row[8] || ''),
+      isPublic: row[9] === true,
     }));
   return { points: points, memories: memories };
+}
+
+function readPublicMemories(userSub, sheet) {
+  return readSheet(sheet).slice(1)
+    .filter(row => String(row[0]) !== userSub && row[9] === true)
+    .map(row => ({
+      id: String(row[1]),
+      title: String(row[2]),
+      note: String(row[3]),
+      latitude: Number(row[4]),
+      longitude: Number(row[5]),
+      createdAt: toIsoString(row[6]),
+      driveFiles: [],
+      address: String(row[8] || ''),
+      isPublic: true,
+      ownerName: String(row[10] || 'ユーザー')
+    }));
 }
 
 function toIsoString(value) {
@@ -363,6 +415,8 @@ function isValidMemory(memory) {
   return memory && typeof memory.id === 'string' && memory.id.length <= 120 &&
     typeof memory.title === 'string' && memory.title.length > 0 && memory.title.length <= 200 &&
     typeof memory.note === 'string' && memory.note.length <= 2000 &&
+    (memory.address === undefined || (typeof memory.address === 'string' && memory.address.length <= 300)) &&
+    (memory.isPublic === undefined || typeof memory.isPublic === 'boolean') &&
     Number.isFinite(memory.latitude) && memory.latitude >= -90 && memory.latitude <= 90 &&
     Number.isFinite(memory.longitude) && memory.longitude >= -180 && memory.longitude <= 180 &&
     typeof memory.createdAt === 'string' && !isNaN(Date.parse(memory.createdAt)) &&

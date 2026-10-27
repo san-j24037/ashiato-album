@@ -9,12 +9,16 @@ export type TrackPoint = {
 export type Memory = {
   id: string
   title: string
+  address: string
   note: string
+  isPublic: boolean
   latitude: number
   longitude: number
   createdAt: string
   driveFiles: { id: string; name: string; url: string; mimeType: string }[]
 }
+
+export type PublicMemory = Memory & { ownerName: string }
 
 export type AppData = {
   points: TrackPoint[]

@@ -27,7 +27,7 @@ export async function loadAppState(): Promise<{ data: AppData; accountSub: strin
   const accountSub = await readValue<string>(database, ACTIVE_ACCOUNT_KEY) ?? null
   const stored = await readValue<AppData>(database, dataKey(accountSub))
   database.close()
-  if (stored) return { data: stored, accountSub }
+  if (stored) return { data: normalizeData(stored), accountSub }
 
   const legacy = localStorage.getItem(STORAGE_KEY)
   if (!legacy) return { data: emptyAppData, accountSub: null }
@@ -40,9 +40,10 @@ export async function loadAppState(): Promise<{ data: AppData; accountSub: strin
     'memories' in parsed &&
     Array.isArray(parsed.memories)
   ) {
-    await saveAppData(parsed as AppData, null)
+    const data = normalizeData(parsed as AppData)
+    await saveAppData(data, null)
     localStorage.removeItem(STORAGE_KEY)
-    return { data: parsed as AppData, accountSub: null }
+    return { data, accountSub: null }
   }
   return { data: emptyAppData, accountSub: null }
 }
@@ -51,7 +52,7 @@ export async function loadAccountData(accountSub: string): Promise<AppData> {
   const database = await openDatabase()
   const data = await readValue<AppData>(database, dataKey(accountSub))
   database.close()
-  return data ?? emptyAppData
+  return normalizeData(data ?? emptyAppData)
 }
 
 export async function setActiveAccount(accountSub: string | null): Promise<void> {
@@ -76,6 +77,17 @@ export async function saveAppData(data: AppData, accountSub: string | null): Pro
     transaction.onabort = () => reject(transaction.error ?? new Error('Local data save was aborted'))
   })
   database.close()
+}
+
+function normalizeData(data: AppData): AppData {
+  return {
+    ...data,
+    memories: data.memories.map((memory) => ({
+      ...memory,
+      address: memory.address ?? '',
+      isPublic: memory.isPublic ?? false,
+    })),
+  }
 }
 
 function dataKey(accountSub: string | null) {

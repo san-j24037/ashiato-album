@@ -35,4 +35,4 @@ npm run build
 npm run cap:sync
 ```
 
-ブラウザー版のGPSにはHTTPS（またはlocalhost）と位置情報の許可が必要です。ページを閉じた後のWeb GPS記録は保証されません。GPSの記録間隔は10秒・30秒・1分から選択できます。地図は地形（OpenTopoMap）と航空写真（Esri World Imagery）を切り替えられます。地図表示にはネットワーク接続が必要です。
+ブラウザー版のGPSにはHTTPS（またはlocalhost）と位置情報の許可が必要です。ページを閉じた後のWeb GPS記録は保証されません。GPSの記録間隔は10秒・30秒・1分から選択できます。地図は標準（OpenStreetMap）・地形（OpenTopoMap）・航空写真（Esri World Imagery）を切り替えられます。地図表示にはネットワーク接続が必要です。

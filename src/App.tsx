@@ -16,15 +16,16 @@ import {
   EyeOff,
   Footprints,
   Heart,
+  Image,
   LocateFixed,
-  Mountain,
+  Map as MapIcon,
   MapPin,
   Menu,
+  Mountain,
   Navigation,
   Pause,
   Play,
   Plus,
-  Image,
   Settings2,
   ShieldCheck,
   Sparkles,
@@ -36,7 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
-import { emptyAppData, type AppData, type Memory, type TrackPoint } from './types'
+import { emptyAppData, type AppData, type Memory, type PublicMemory, type TrackPoint } from './types'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined
@@ -50,8 +51,8 @@ const intervals = [
 ]
 
 type Tab = 'map' | 'spots' | 'settings'
-type MapStyle = 'terrain' | 'satellite'
-type SyncResponse = { ok: boolean; error?: string; data?: AppData }
+type MapStyle = 'standard' | 'terrain' | 'satellite'
+type SyncResponse = { ok: boolean; error?: string; data?: AppData; recommendations?: PublicMemory[] }
 type AccountProfile = { id: string; name: string; email: string }
 
 function readInterval() {
@@ -60,21 +61,26 @@ function readInterval() {
 }
 
 function readMapStyle(): MapStyle {
-  return localStorage.getItem(MAP_STYLE_KEY) === 'satellite' ? 'satellite' : 'terrain'
+  const savedStyle = localStorage.getItem(MAP_STYLE_KEY)
+  return savedStyle === 'terrain' || savedStyle === 'satellite' ? savedStyle : 'standard'
 }
 
 function MapView({
   points,
   memories,
+  recommendations,
   active,
   onSelect,
+  onSelectRecommendation,
   onAddPoint,
   centerRequest,
 }: {
   points: TrackPoint[]
   memories: Memory[]
+  recommendations: PublicMemory[]
   active: boolean
   onSelect(memory: Memory): void
+  onSelectRecommendation(memory: PublicMemory): void
   onAddPoint(point: TrackPoint): void
   centerRequest: [number, number] | null
 }) {
@@ -117,16 +123,21 @@ function MapView({
     const map = mapRef.current
     if (!map) return
     tileLayerRef.current?.remove()
-    const tileLayer = mapStyle === 'terrain'
-      ? L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    const tileLayer = mapStyle === 'standard'
+      ? L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        })
+      : mapStyle === 'terrain'
+        ? L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
           maxZoom: 19,
           maxNativeZoom: 17,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="https://opentopomap.org/">OpenTopoMap</a> (CC-BY-SA)',
         })
-      : L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-          maxZoom: 19,
-          attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
-        })
+        : L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 19,
+            attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+          })
     tileLayer.addTo(map)
     tileLayerRef.current = tileLayer
     localStorage.setItem(MAP_STYLE_KEY, mapStyle)
@@ -170,6 +181,18 @@ function MapView({
         .on('click', () => onSelect(memory))
         .addTo(layers)
     }
+    for (const memory of recommendations) {
+      const icon = L.divIcon({
+        className: 'recommendation-marker',
+        html: '<span>★</span>',
+        iconSize: [36, 42],
+        iconAnchor: [18, 38],
+      })
+      L.marker([memory.latitude, memory.longitude], { icon })
+        .bindTooltip(memory.title)
+        .on('click', () => onSelectRecommendation(memory))
+        .addTo(layers)
+    }
     const lastPoint = points[points.length - 1]
     if (lastPoint) {
       if (!userMarkerRef.current) {
@@ -192,7 +215,7 @@ function MapView({
       map.setView([latest.latitude, latest.longitude], Math.max(map.getZoom(), 14), { animate: true })
       lastCenteredIdRef.current = latest.id
     }
-  }, [points, memories, onSelect])
+  }, [points, memories, recommendations, onSelect, onSelectRecommendation])
 
   useEffect(() => {
     if (centerRequest && mapRef.current) mapRef.current.setView(centerRequest, Math.max(mapRef.current.getZoom(), 14))
@@ -206,6 +229,14 @@ function MapView({
         {active ? '足跡を記録中' : '記録は停止中'}
       </div>
       <div className="map-style-switch" role="group" aria-label="地図の表示方法">
+        <button
+          className={mapStyle === 'standard' ? 'selected' : ''}
+          onClick={() => setMapStyle('standard')}
+          aria-pressed={mapStyle === 'standard'}
+        >
+          <MapIcon size={15} />
+          標準
+        </button>
         <button
           className={mapStyle === 'terrain' ? 'selected' : ''}
           onClick={() => setMapStyle('terrain')}
@@ -247,6 +278,7 @@ function App() {
   const [authBusy, setAuthBusy] = useState(false)
   const [authError, setAuthError] = useState('')
   const [tab, setTab] = useState<Tab>('map')
+  const [recommendations, setRecommendations] = useState<PublicMemory[]>([])
   const [active, setActive] = useState(false)
   const [intervalSeconds, setIntervalSeconds] = useState(readInterval)
   const [accessToken, setAccessToken] = useState<string | null>(null)
@@ -254,10 +286,17 @@ function App() {
   const [syncing, setSyncing] = useState(false)
   const [message, setMessage] = useState('')
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null)
+  const [selectedRecommendation, setSelectedRecommendation] = useState<PublicMemory | null>(null)
+  const [editSpotTitle, setEditSpotTitle] = useState('')
+  const [editSpotAddress, setEditSpotAddress] = useState('')
+  const [editSpotNote, setEditSpotNote] = useState('')
+  const [editSpotIsPublic, setEditSpotIsPublic] = useState(false)
   const [selectedPoint, setSelectedPoint] = useState<TrackPoint | null>(null)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
   const [spotTitle, setSpotTitle] = useState('')
+  const [spotAddress, setSpotAddress] = useState('')
   const [spotNote, setSpotNote] = useState('')
+  const [spotIsPublic, setSpotIsPublic] = useState(false)
   const [nativeWatcherId, setNativeWatcherId] = useState<string | null>(null)
   const nativeWatcherRef = useRef<string | null>(null)
   const [hasSynced, setHasSynced] = useState(false)
@@ -404,10 +443,24 @@ function App() {
     setSelectedPoint(point)
     setShowSaveDialog(true)
     setSpotTitle('')
+    setSpotAddress('')
     setSpotNote('')
+    setSpotIsPublic(false)
   }, [])
 
-  const onSelectMemory = useCallback((memory: Memory) => setSelectedMemory(memory), [])
+  const onSelectMemory = useCallback((memory: Memory) => {
+    setSelectedRecommendation(null)
+    setSelectedMemory(memory)
+    setEditSpotTitle(memory.title)
+    setEditSpotAddress(memory.address ?? '')
+    setEditSpotNote(memory.note)
+    setEditSpotIsPublic(memory.isPublic ?? false)
+  }, [])
+
+  const onSelectRecommendation = useCallback((memory: PublicMemory) => {
+    setSelectedMemory(null)
+    setSelectedRecommendation(memory)
+  }, [])
 
   const finishLogin = async (user: AccountProfile) => {
     const saved = await loadAccountData(user.id)
@@ -489,6 +542,7 @@ function App() {
       setActive(false)
       setHasSynced(false)
       setSelectedMemory(null)
+      setSelectedRecommendation(null)
       setSelectedPoint(null)
       setTab('map')
       setAuthMode('login')
@@ -508,15 +562,39 @@ function App() {
     const memory: Memory = {
       id: crypto.randomUUID(),
       title: spotTitle.trim(),
+      address: spotAddress.trim(),
       note: spotNote.trim(),
+      isPublic: spotIsPublic,
       latitude: selectedPoint.latitude,
       longitude: selectedPoint.longitude,
       createdAt: new Date().toISOString(),
       driveFiles: [],
     }
-    setData((current) => ({ ...current, memories: [...current.memories, memory] }))
+    const nextData = { ...data, memories: [...data.memories, memory] }
+    setData(nextData)
     setShowSaveDialog(false)
-    setMessage(`「${memory.title}」をスポットに保存しました`)
+    setMessage(`「${memory.title}」をスポットに保存しました。スプレッドシートに同期しています`)
+    void syncData(nextData)
+  }
+
+  const saveMemoryDetails = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!selectedMemory || !editSpotTitle.trim()) return
+    const updatedMemory = {
+      ...selectedMemory,
+      title: editSpotTitle.trim(),
+      address: editSpotAddress.trim(),
+      note: editSpotNote.trim(),
+      isPublic: editSpotIsPublic,
+    }
+    const nextData = {
+      ...data,
+      memories: data.memories.map((memory) => memory.id === updatedMemory.id ? updatedMemory : memory),
+    }
+    setData(nextData)
+    setSelectedMemory(updatedMemory)
+    setMessage('お気に入り情報を保存しています')
+    void syncData(nextData)
   }
 
   const requestDriveToken = useCallback((): Promise<string> => {
@@ -599,6 +677,7 @@ function App() {
       const uploadData = sourceData
       const batchCount = Math.max(1, Math.ceil(uploadData.points.length / 3000), Math.ceil(uploadData.memories.length / 100))
       let remoteData: AppData | undefined
+      let remoteRecommendations: PublicMemory[] = []
       let synchronizedData: AppData | undefined
       for (let index = 0; index < batchCount; index += 1) {
         const pointBatch = uploadData.points.slice(index * 3000, (index + 1) * 3000)
@@ -612,11 +691,13 @@ function App() {
         const result = (await response.json()) as SyncResponse
         if (!response.ok || !result.ok) throw new Error(result.error ?? `同期に失敗しました (${response.status})`)
         remoteData = result.data
+        remoteRecommendations = result.recommendations ?? []
       }
       if (remoteData) {
         const points = new Map([...remoteData.points, ...uploadData.points].map((point) => [point.id, point]))
         const memories = new Map([...remoteData.memories, ...uploadData.memories].map((memory) => [memory.id, memory]))
         synchronizedData = { points: [...points.values()], memories: [...memories.values()] }
+        setRecommendations(remoteRecommendations)
       }
       if (synchronizedData) setData(synchronizedData)
       setHasSynced(true)
@@ -931,7 +1012,7 @@ function App() {
                 {recentMemories.map((memory) => (
                   <button className="memory-card" key={memory.id} onClick={() => setSelectedMemory(memory)}>
                     <span className="memory-card-icon"><Heart size={17} fill="currentColor" /></span>
-                    <span className="memory-card-text"><strong>{memory.title}</strong><small>{memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
+                    <span className="memory-card-text"><strong>{memory.title}</strong><small>{memory.address || memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{memory.isPublic ? 'おすすめとして公開中' : memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
                     <ChevronDown size={16} className="memory-chevron" />
                   </button>
                 ))}
@@ -958,7 +1039,16 @@ function App() {
             <button className="avatar-button" onClick={() => setTab('settings')} aria-label="アカウント設定">{account.name.slice(0, 1)}</button>
           </div>
         </header>
-        <MapView points={data.points} memories={data.memories} active={active} onSelect={onSelectMemory} onAddPoint={onAddPoint} centerRequest={centerRequest} />
+        <MapView
+          points={data.points}
+          memories={data.memories}
+          recommendations={recommendations}
+          active={active}
+          onSelect={onSelectMemory}
+          onSelectRecommendation={onSelectRecommendation}
+          onAddPoint={onAddPoint}
+          centerRequest={centerRequest}
+        />
         <div className="map-actions">
           <button className="floating-button locate-button" onClick={() => {
             const latest = data.points.at(-1)
@@ -982,8 +1072,22 @@ function App() {
           <div className="memory-detail">
             <button className="detail-close icon-button" onClick={() => setSelectedMemory(null)} aria-label="閉じる"><X size={18} /></button>
             <div className="detail-kicker"><Heart size={14} fill="currentColor" /> FAVORITE SPOT</div>
-            <h2>{selectedMemory.title}</h2>
-            {selectedMemory.note && <p>{selectedMemory.note}</p>}
+            <form className="spot-detail-form" onSubmit={saveMemoryDetails}>
+              <label className="field-label">スポット名
+                <input className="text-field" value={editSpotTitle} maxLength={200} onChange={(event) => setEditSpotTitle(event.target.value)} required />
+              </label>
+              <label className="field-label">住所
+                <input className="text-field" value={editSpotAddress} maxLength={300} onChange={(event) => setEditSpotAddress(event.target.value)} placeholder="住所を入力" />
+              </label>
+              <label className="field-label">説明
+                <textarea className="text-field note-field" value={editSpotNote} maxLength={2000} onChange={(event) => setEditSpotNote(event.target.value)} rows={3} />
+              </label>
+              <label className="visibility-option">
+                <input type="checkbox" checked={editSpotIsPublic} onChange={(event) => setEditSpotIsPublic(event.target.checked)} />
+                <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
+              </label>
+              <button className="primary-button full-button" type="submit" disabled={syncing}><Check size={16} />変更を保存</button>
+            </form>
             <div className="detail-coordinate">{selectedMemory.latitude.toFixed(5)}°, {selectedMemory.longitude.toFixed(5)}°</div>
             <div className="drive-files">
               {selectedMemory.driveFiles.map((file) => (
@@ -1001,6 +1105,17 @@ function App() {
             </div>
           </div>
         )}
+        {selectedRecommendation && (
+          <div className="memory-detail">
+            <button className="detail-close icon-button" onClick={() => setSelectedRecommendation(null)} aria-label="閉じる"><X size={18} /></button>
+            <div className="detail-kicker recommendation-kicker"><MapPin size={14} /> USER RECOMMENDATION</div>
+            <h2>{selectedRecommendation.title}</h2>
+            {selectedRecommendation.address && <p>{selectedRecommendation.address}</p>}
+            {selectedRecommendation.note && <p>{selectedRecommendation.note}</p>}
+            <div className="detail-coordinate">{selectedRecommendation.latitude.toFixed(5)}°, {selectedRecommendation.longitude.toFixed(5)}°</div>
+            <p className="recommendation-owner">おすすめした人：{selectedRecommendation.ownerName}</p>
+          </div>
+        )}
       </section>
 
       {showSaveDialog && (
@@ -1013,10 +1128,16 @@ function App() {
             <p>いつかまた訪れたい場所に、名前をつけましょう。</p>
             {selectedPoint && <div className="dialog-coordinate"><MapPin size={15} />{selectedPoint.latitude.toFixed(5)}°, {selectedPoint.longitude.toFixed(5)}°</div>}
             <label className="field-label" htmlFor="spot-title">スポット名</label>
-            <input id="spot-title" className="text-field" value={spotTitle} onChange={(event) => setSpotTitle(event.target.value)} placeholder="例：夕焼けがきれいな丘" required autoFocus />
-            <label className="field-label" htmlFor="spot-note">メモ <span>任意</span></label>
-            <textarea id="spot-note" className="text-field note-field" value={spotNote} onChange={(event) => setSpotNote(event.target.value)} placeholder="ここでの思い出を書き留める" rows={3} />
-            <button className="primary-button full-button" type="submit"><Heart size={17} />スポットに保存</button>
+            <input id="spot-title" className="text-field" value={spotTitle} maxLength={200} onChange={(event) => setSpotTitle(event.target.value)} placeholder="例：夕焼けがきれいな丘" required autoFocus />
+            <label className="field-label" htmlFor="spot-address">住所 <span>任意</span></label>
+            <input id="spot-address" className="text-field" value={spotAddress} maxLength={300} onChange={(event) => setSpotAddress(event.target.value)} placeholder="住所を入力" />
+            <label className="field-label" htmlFor="spot-note">説明 <span>任意</span></label>
+            <textarea id="spot-note" className="text-field note-field" value={spotNote} maxLength={2000} onChange={(event) => setSpotNote(event.target.value)} placeholder="場所のおすすめポイントや思い出" rows={3} />
+            <label className="visibility-option">
+              <input type="checkbox" checked={spotIsPublic} onChange={(event) => setSpotIsPublic(event.target.checked)} />
+              <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
+            </label>
+            <button className="primary-button full-button" type="submit" disabled={syncing}><Heart size={17} />スポットに保存</button>
           </form>
         </div>
       )}
