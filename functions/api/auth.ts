@@ -3,6 +3,7 @@ import {
   clearSessionCookie,
   createSessionToken,
   hashPassword,
+  AuthServiceError,
   isRecord,
   isSameOriginRequest,
   normalizeEmail,
@@ -59,7 +60,8 @@ export const onRequestPost = async ({ request, env }: { request: Request; env: E
     return errorResponse('操作を確認してください', 400)
   } catch (error) {
     console.error('Account authentication request failed', error)
-    return errorResponse('認証サービスを利用できません。設定を確認してから再度お試しください', 503)
+    const code = error instanceof AuthServiceError ? error.code : 'AUTH_INTERNAL_ERROR'
+    return errorResponse(`認証サービスを利用できません（${code}）。設定を確認してから再度お試しください`, 503)
   }
 }
 
@@ -89,7 +91,7 @@ async function registerAccount(env: Env, body: Record<string, unknown>): Promise
   })
   if (result.ok !== true) {
     if (result.code === 'EMAIL_EXISTS') return errorResponse('このメールアドレスは登録済みです', 409)
-    throw new Error(typeof result.error === 'string' ? result.error : 'Account creation failed')
+    throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Account service rejected the registration')
   }
   return authenticatedResponse(env, account)
 }
@@ -103,7 +105,7 @@ async function loginAccount(env: Env, body: Record<string, unknown>): Promise<Re
   }
 
   const lookup = await callGas(env, { action: 'accountLookup', email })
-  if (lookup.ok !== true) throw new Error('Account lookup failed')
+  if (lookup.ok !== true) throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Account lookup failed')
   const storedUser = isRecord(lookup.user) ? lookup.user : null
   const saltValue = storedUser && typeof storedUser.passwordSalt === 'string' ? storedUser.passwordSalt : null
   const expectedHash = storedUser && typeof storedUser.passwordHash === 'string' ? storedUser.passwordHash : DUMMY_HASH
@@ -115,13 +117,13 @@ async function loginAccount(env: Env, body: Record<string, unknown>): Promise<Re
   if (!storedUser || !passwordMatches || lockUntil > Date.now()) {
     if (storedUser && lockUntil <= Date.now()) {
       const failure = await callGas(env, { action: 'accountLoginFailure', email })
-      if (failure.ok !== true) throw new Error('Could not record failed login attempt')
+      if (failure.ok !== true) throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Could not record failed login attempt')
     }
     return errorResponse('メールアドレスまたはパスワードが正しくありません', 401)
   }
 
   const success = await callGas(env, { action: 'accountLoginSuccess', email })
-  if (success.ok !== true) throw new Error('Could not record successful login')
+  if (success.ok !== true) throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Could not record successful login')
   const account: Account = {
     id: typeof storedUser.userId === 'string' ? storedUser.userId : '',
     email,

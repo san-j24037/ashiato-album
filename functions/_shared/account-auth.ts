@@ -10,6 +10,21 @@ export interface AuthEnvironment {
   APP_SESSION_SECRET?: string
 }
 
+export type AuthServiceErrorCode =
+  | 'AUTH_CONFIG_MISSING'
+  | 'GAS_URL_INVALID'
+  | 'GAS_CONNECTION_FAILED'
+  | 'GAS_HTTP_ERROR'
+  | 'GAS_RESPONSE_INVALID'
+  | 'GAS_REQUEST_REJECTED'
+
+export class AuthServiceError extends Error {
+  constructor(readonly code: AuthServiceErrorCode, message: string) {
+    super(message)
+    this.name = 'AuthServiceError'
+  }
+}
+
 export interface SessionClaims extends Account {
   sub: string
   exp: number
@@ -23,26 +38,36 @@ const encoder = new TextEncoder()
 
 export async function callGas(env: AuthEnvironment, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (!env.GAS_EXEC_URL || !env.GAS_SERVICE_KEY || !env.APP_SESSION_SECRET) {
-    throw new Error('Authentication services are not configured')
+    throw new AuthServiceError('AUTH_CONFIG_MISSING', 'Authentication services are not configured')
   }
   let endpoint: URL
   try {
     endpoint = new URL(env.GAS_EXEC_URL)
   } catch {
-    throw new Error('GAS_EXEC_URL must be an absolute HTTPS URL')
+    throw new AuthServiceError('GAS_URL_INVALID', 'GAS_EXEC_URL must be an absolute HTTPS URL')
   }
   if (endpoint.protocol !== 'https:' || endpoint.hostname !== 'script.google.com') {
-    throw new Error('GAS_EXEC_URL must use the Google Apps Script HTTPS endpoint')
+    throw new AuthServiceError('GAS_URL_INVALID', 'GAS_EXEC_URL must use the Google Apps Script HTTPS endpoint')
   }
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ ...payload, serviceKey: env.GAS_SERVICE_KEY }),
-    redirect: 'follow',
-  })
-  if (!response.ok) throw new Error('Account service is unavailable')
-  const result: unknown = await response.json()
-  if (!isRecord(result)) throw new Error('Account service returned an invalid response')
+  let response: Response
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ ...payload, serviceKey: env.GAS_SERVICE_KEY }),
+      redirect: 'follow',
+    })
+  } catch {
+    throw new AuthServiceError('GAS_CONNECTION_FAILED', 'Could not connect to the account service')
+  }
+  if (!response.ok) throw new AuthServiceError('GAS_HTTP_ERROR', 'Account service is unavailable')
+  let result: unknown
+  try {
+    result = await response.json()
+  } catch {
+    throw new AuthServiceError('GAS_RESPONSE_INVALID', 'Account service returned invalid JSON')
+  }
+  if (!isRecord(result)) throw new AuthServiceError('GAS_RESPONSE_INVALID', 'Account service returned an invalid response')
   return result
 }
 
