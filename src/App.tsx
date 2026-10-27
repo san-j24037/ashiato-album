@@ -17,12 +17,14 @@ import {
   Footprints,
   Heart,
   LocateFixed,
+  Mountain,
   MapPin,
   Menu,
   Navigation,
   Pause,
   Play,
   Plus,
+  Image,
   Settings2,
   ShieldCheck,
   Sparkles,
@@ -40,6 +42,7 @@ const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('Backg
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '')
 const INTERVAL_KEY = 'ashiato-record-interval'
+const MAP_STYLE_KEY = 'ashiato-map-style'
 const intervals = [
   { seconds: 10, label: '10秒ごと', detail: '経路を細かく残す' },
   { seconds: 30, label: '30秒ごと', detail: 'バランス重視' },
@@ -47,12 +50,17 @@ const intervals = [
 ]
 
 type Tab = 'map' | 'spots' | 'settings'
+type MapStyle = 'terrain' | 'satellite'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData }
 type AccountProfile = { id: string; name: string; email: string }
 
 function readInterval() {
   const value = Number(localStorage.getItem(INTERVAL_KEY))
   return intervals.some((option) => option.seconds === value) ? value : 10
+}
+
+function readMapStyle(): MapStyle {
+  return localStorage.getItem(MAP_STYLE_KEY) === 'satellite' ? 'satellite' : 'terrain'
 }
 
 function MapView({
@@ -72,19 +80,17 @@ function MapView({
 }) {
   const elementRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
+  const tileLayerRef = useRef<L.TileLayer | null>(null)
   const layerRef = useRef<L.LayerGroup | null>(null)
   const userMarkerRef = useRef<L.CircleMarker | null>(null)
   const lastCenteredIdRef = useRef<string | null>(null)
   const pointsRef = useRef(points)
+  const [mapStyle, setMapStyle] = useState<MapStyle>(readMapStyle)
 
   useEffect(() => {
     if (!elementRef.current) return
     const map = L.map(elementRef.current, { zoomControl: false, attributionControl: true })
       .setView([35.6812, 139.7671], 13)
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-    }).addTo(map)
     L.control.zoom({ position: 'bottomright' }).addTo(map)
     const layers = L.layerGroup().addTo(map)
     mapRef.current = map
@@ -102,9 +108,29 @@ function MapView({
       resizeObserver.disconnect()
       map.remove()
       mapRef.current = null
+      tileLayerRef.current = null
       layerRef.current = null
     }
   }, [onAddPoint])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    tileLayerRef.current?.remove()
+    const tileLayer = mapStyle === 'terrain'
+      ? L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          maxNativeZoom: 17,
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="https://opentopomap.org/">OpenTopoMap</a> (CC-BY-SA)',
+        })
+      : L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+          maxZoom: 19,
+          attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+        })
+    tileLayer.addTo(map)
+    tileLayerRef.current = tileLayer
+    localStorage.setItem(MAP_STYLE_KEY, mapStyle)
+  }, [mapStyle])
 
   useEffect(() => {
     pointsRef.current = points
@@ -178,6 +204,24 @@ function MapView({
       <div className={`map-status ${active ? 'is-recording' : ''}`}>
         <span className="status-dot" />
         {active ? '足跡を記録中' : '記録は停止中'}
+      </div>
+      <div className="map-style-switch" role="group" aria-label="地図の表示方法">
+        <button
+          className={mapStyle === 'terrain' ? 'selected' : ''}
+          onClick={() => setMapStyle('terrain')}
+          aria-pressed={mapStyle === 'terrain'}
+        >
+          <Mountain size={15} />
+          地形
+        </button>
+        <button
+          className={mapStyle === 'satellite' ? 'selected' : ''}
+          onClick={() => setMapStyle('satellite')}
+          aria-pressed={mapStyle === 'satellite'}
+        >
+          <Image size={15} />
+          航空写真
+        </button>
       </div>
       <div className="map-hint">
         <Compass size={15} />
