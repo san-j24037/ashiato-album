@@ -33,7 +33,7 @@ export interface SessionClaims extends Account {
 
 const SESSION_COOKIE = 'ashiato_session'
 const SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7
-const HASH_ITERATIONS = 600_000
+const HASH_ITERATIONS = 100_000
 const encoder = new TextEncoder()
 
 export async function callGas(env: AuthEnvironment, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
