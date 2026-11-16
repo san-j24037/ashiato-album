@@ -45,3 +45,22 @@ a:focus-visible {
   color: #244c3f;
   background: #d3e7d9;
 }
+
+/* Build version shown at the very top of every screen. */
+.app-version {
+  position: fixed;
+  z-index: 100;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0 8px;
+  color: #6f7d75;
+  border-radius: 0 0 6px 6px;
+  background: rgb(255 255 255 / 0.85);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  line-height: 12px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  pointer-events: none;
+}

@@ -13,6 +13,7 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
+    <div className="app-version" aria-label={`バージョン ${__APP_VERSION__}`}>ver.{__APP_VERSION__}</div>
     <App />
   </StrictMode>,
 )
