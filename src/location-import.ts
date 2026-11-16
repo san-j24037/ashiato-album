@@ -1,4 +1,5 @@
 import {
+  LocationImportError,
   finalizePoints,
   isValidLatLng,
   parseTimelinePoints,
@@ -32,11 +33,16 @@ export function parseLocationFile(fileName: string, text: string): LocationImpor
     return finish(parseCsv(trimmed), 'CSV')
   }
 
+  if (!trimmed) throw new LocationImportError('ファイルが空です', 'エクスポートが完了したファイルを選び直してください')
   let json: unknown
   try {
     json = JSON.parse(trimmed) as unknown
-  } catch {
-    throw new Error('ファイルを読み取れません。JSON・GeoJSON・GPX・KML・CSVのいずれかを選択してください')
+  } catch (error) {
+    const detail = error instanceof Error ? `（${error.message}）` : ''
+    throw new LocationImportError(
+      `JSONとして読み取れませんでした${detail}`,
+      'ファイルが途中で切れている（ダウンロード・転送が未完了）か、JSON以外のファイルの可能性があります。もう一度エクスポートしてから選択してください',
+    )
   }
   if (isGeoJson(json)) return finish(parseGeoJson(json), 'GeoJSON')
   return { points: parseTimelinePoints(json), format: 'Googleタイムライン', skipped: 0 }
@@ -44,9 +50,16 @@ export function parseLocationFile(fileName: string, text: string): LocationImpor
 
 function finish(collector: Collector, format: string): LocationImportResult {
   if (!collector.points.length) {
-    throw new Error(collector.skipped
-      ? `${format}ファイルに${collector.skipped.toLocaleString()}件の地点がありましたが、${NO_TIME_MESSAGE}`
-      : `${format}ファイルにGPS地点が見つかりません`)
+    if (collector.skipped) {
+      throw new LocationImportError(
+        `${format}ファイルに${collector.skipped.toLocaleString()}件の地点がありましたが、${NO_TIME_MESSAGE}`,
+        '足跡は日時つきで記録するため、日時のない地点は取り込めません。記録アプリから「時刻つきのトラック（ログ）」として書き出してください',
+      )
+    }
+    throw new LocationImportError(
+      `${format}ファイルにGPS地点が見つかりませんでした`,
+      '緯度・経度が含まれているファイルか確認してください',
+    )
   }
   return { points: finalizePoints(collector.points), format, skipped: collector.skipped }
 }
@@ -63,9 +76,17 @@ function add(collector: Collector, latitude: number, longitude: number, time: nu
 // ---------- XML (GPX / KML) ----------
 
 function parseXml(text: string, label: string): Document {
-  const document = new DOMParser().parseFromString(text, 'application/xml')
-  if (document.getElementsByTagName('parsererror').length) {
-    throw new Error(`${label}ファイルを読み取れません。ファイルの内容を確認してください`)
+  let document: Document | null = null
+  try {
+    document = new DOMParser().parseFromString(text, 'application/xml')
+  } catch {
+    document = null
+  }
+  if (!document || document.getElementsByTagName('parsererror').length) {
+    throw new LocationImportError(
+      `${label}ファイルの形式が正しくないため読み取れませんでした`,
+      'ファイルが途中で切れていないか確認し、もう一度書き出してから選択してください',
+    )
   }
   return document
 }
@@ -252,7 +273,9 @@ function findColumn(headers: string[], names: string[]): number {
 
 function parseCsv(text: string): Collector {
   const lines = text.split(/\r?\n/).filter((line) => line.trim())
-  if (lines.length < 2) throw new Error('CSVファイルにデータ行がありません')
+  if (lines.length < 2) {
+    throw new LocationImportError('CSVファイルにデータ行がありません', '1行目に列名、2行目以降に地点のデータを入れてください')
+  }
   const delimiter = lines[0].includes('\t') ? '\t' : lines[0].includes(';') && !lines[0].includes(',') ? ';' : ','
   const headers = splitCsvLine(lines[0], delimiter).map((header) => header.toLowerCase().replace(/[\s_()（）]/g, ''))
 
@@ -263,10 +286,16 @@ function parseCsv(text: string): Collector {
   const clockColumn = findColumn(headers, ['time', '時刻'])
   const accuracyColumn = findColumn(headers, ['accuracy', 'accuracym', '精度', 'hdop'])
   if (latitudeColumn < 0 || longitudeColumn < 0) {
-    throw new Error('CSVの1行目に緯度・経度の列名（latitude / longitude、または 緯度 / 経度）が必要です')
+    throw new LocationImportError(
+      'CSVに緯度・経度の列が見つかりませんでした',
+      '1行目の列名を「緯度,経度,日時」または「latitude,longitude,time」にしてください',
+    )
   }
   if (timeColumn < 0) {
-    throw new Error('CSVの1行目に日時の列名（time / timestamp / 日時 など）が必要です')
+    throw new LocationImportError(
+      'CSVに日時の列が見つかりませんでした',
+      '1行目に日時の列名（日時 / time / timestamp など）を追加してください。例：緯度,経度,日時',
+    )
   }
 
   const collector: Collector = { points: [], skipped: 0 }

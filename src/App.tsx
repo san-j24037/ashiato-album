@@ -41,6 +41,7 @@ import './App.css'
 import { AdminPage } from './AdminPage'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
 import { LOCATION_FILE_ACCEPT, parseLocationFile } from './location-import'
+import { LocationImportError } from './timeline-import'
 import { emptyAppData, type AppData, type Memory, type PublicMemory, type TrackPoint } from './types'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
@@ -57,6 +58,21 @@ const intervals = [
 type Tab = 'map' | 'spots' | 'settings'
 type MapStyle = 'standard' | 'terrain' | 'satellite'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData; recommendations?: PublicMemory[] }
+type ImportResult = {
+  status: 'success' | 'partial' | 'nothing-new' | 'failure'
+  fileName: string
+  format?: string
+  total?: number
+  added?: number
+  duplicates?: number
+  skipped?: number
+  firstAt?: string
+  lastAt?: string
+  syncError?: string
+  cause?: string
+  hint?: string
+}
+
 type AccountProfile = { id: string; name: string; email: string; isAdmin?: boolean }
 type PlaceSearchResult = {
   id: string
@@ -475,6 +491,7 @@ function App() {
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'reset'>('login')
   const [resetStep, setResetStep] = useState<'request' | 'confirm'>('request')
   const [adminOpen, setAdminOpen] = useState(false)
+  const [importResult, setImportResult] = useState<ImportResult | null>(null)
   const [resetCode, setResetCode] = useState('')
   const [authNotice, setAuthNotice] = useState('')
   const [authName, setAuthName] = useState('')
@@ -522,7 +539,7 @@ function App() {
   const webWatchId = useRef<number | null>(null)
   const intervalRef = useRef(intervalSeconds)
   const lastAcceptedTimeRef = useRef(0)
-  const syncDataRef = useRef<(sourceData?: AppData) => Promise<boolean>>(async () => false)
+  const syncDataRef = useRef<(sourceData?: AppData) => Promise<string | null>>(async () => null)
 
   useEffect(() => {
     let cancelled = false
@@ -990,10 +1007,11 @@ function App() {
       if (synchronizedData) setData(synchronizedData)
       setHasSynced(true)
       setMessage('アカウントに同期しました')
-      return true
+      return null
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '同期に失敗しました')
-      return false
+      const syncError = error instanceof Error ? error.message : '同期に失敗しました'
+      setMessage(syncError)
+      return syncError
     } finally {
       setSyncing(false)
     }
@@ -1142,26 +1160,52 @@ function App() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
+    const fail = (cause: string, hint?: string, format?: string) => {
+      setImportResult({ status: 'failure', fileName: file.name, format, cause, hint })
+    }
     if (!/\.(json|geojson|gpx|kml|csv)$/i.test(file.name)) {
-      setMessage('JSON・GeoJSON・GPX・KML・CSVのいずれかの位置情報ファイルを選択してください')
+      fail('対応していないファイル形式です', '拡張子が .json / .geojson / .gpx / .kml / .csv のファイルを選択してください。ZIPファイルの場合は展開してから中のファイルを選んでください')
+      return
+    }
+    if (file.size === 0) {
+      fail('ファイルが空です（0バイト）', 'エクスポートが完了したファイルを選び直してください')
       return
     }
     if (file.size > 50 * 1024 * 1024) {
-      setMessage('ファイルは50MB以下のものを選択してください')
+      fail(`ファイルが大きすぎます（${(file.size / 1024 / 1024).toFixed(1)}MB。上限は50MB）`, '期間を区切ってエクスポートするか、ファイルを分割してから取り込んでください')
       return
     }
 
     setImportingTimeline(true)
+    setImportResult(null)
     setMessage('')
     try {
-      const { points: importedPoints, format, skipped } = parseLocationFile(file.name, await file.text())
+      let text: string
+      try {
+        text = await file.text()
+      } catch {
+        fail('ファイルを開けませんでした', 'クラウド上にしかないファイルの場合は、端末にダウンロードしてから選択してください')
+        return
+      }
+
+      const { points: importedPoints, format, skipped } = parseLocationFile(file.name, text)
       const pointKey = (point: TrackPoint) => (
         `${point.recordedAt}|${point.latitude.toFixed(7)}|${point.longitude.toFixed(7)}`
       )
       const existingKeys = new Set(data.points.map(pointKey))
       const newPoints = importedPoints.filter((point) => !existingKeys.has(pointKey(point)))
+      const summary = {
+        fileName: file.name,
+        format,
+        total: importedPoints.length,
+        added: newPoints.length,
+        duplicates: importedPoints.length - newPoints.length,
+        skipped,
+        firstAt: importedPoints[0]?.recordedAt,
+        lastAt: importedPoints[importedPoints.length - 1]?.recordedAt,
+      }
       if (!newPoints.length) {
-        setMessage('読み込んだGPS地点はすべて登録済みです')
+        setImportResult({ ...summary, status: 'nothing-new' })
         return
       }
 
@@ -1174,17 +1218,22 @@ function App() {
       setData(nextData)
       const latestImportedPoint = newPoints[newPoints.length - 1]
       setCenterRequest([latestImportedPoint.latitude, latestImportedPoint.longitude])
-      setTab('map')
-      const skippedNote = skipped ? `（日時のない${skipped.toLocaleString()}件は除外）` : ''
-      setMessage(`${format}から${newPoints.length.toLocaleString()}件のGPS地点を追加しました${skippedNote}。アカウントに同期しています…`)
       // Reflect the imported points in the account spreadsheet right away.
-      const synced = await syncData(nextData)
-      setMessage(synced
-        ? `${format}から${newPoints.length.toLocaleString()}件のGPS地点を追加し、アカウントに同期しました${skippedNote}`
-        : `${newPoints.length.toLocaleString()}件のGPS地点を端末に追加しましたが、同期に失敗しました。通信状態を確認して「アカウントに同期」を押してください`)
+      const syncError = await syncData(nextData)
+      setMessage('')
+      setImportResult(syncError
+        ? { ...summary, status: 'partial', syncError }
+        : { ...summary, status: 'success' })
     } catch (error) {
-      console.error('タイムラインを読み込めませんでした。', error)
-      setMessage(error instanceof Error ? error.message : 'タイムラインを読み込めませんでした')
+      console.error('位置情報ファイルを読み込めませんでした。', error)
+      if (error instanceof LocationImportError) {
+        fail(error.message, error.hint)
+      } else {
+        fail(
+          `予期しないエラーが発生しました（${error instanceof Error ? error.message : String(error)}）`,
+          'ページを再読み込みしてからもう一度お試しください。解決しない場合は、このメッセージを管理者に伝えてください',
+        )
+      }
     } finally {
       setImportingTimeline(false)
     }
@@ -1416,6 +1465,12 @@ function App() {
               <FileUp size={17} />{importingTimeline ? '読み込み・同期中…' : 'ファイルを選択'}
             </button>
             <p className="small-muted">読み込んだ地点は端末に保存され、続けてアカウント（スプレッドシート）へ自動で同期されます。</p>
+            <details className="import-guide">
+              <summary>スマートフォンからタイムラインを書き出すには</summary>
+              <p><strong>Android</strong>：端末の「設定」→「位置情報」→「位置情報サービス」→「タイムライン」→「タイムラインのデータをエクスポート」で保存したJSONファイルを選びます。</p>
+              <p><strong>iPhone</strong>：Googleマップアプリのプロフィールアイコン →「設定」→「個人的なコンテンツ」→「タイムラインのデータをエクスポート」で「ファイル」に保存したJSONファイルを選びます。</p>
+              <p>メニュー名は端末やアプリのバージョンによって異なる場合があります。ファイルが大きい場合は、端末に保存してから選択してください。</p>
+            </details>
             <div className="settings-divider" />
             <div className="section-kicker">ACCOUNT & SYNC</div>
             <h2>ログイン中のアカウント</h2>
@@ -1608,6 +1663,67 @@ function App() {
         )}
       </section>
 
+      {importResult && (
+        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setImportResult(null) }}>
+          <section className={`save-dialog import-result ${importResult.status}`} role="alertdialog" aria-labelledby="import-result-title">
+            <button type="button" className="dialog-close icon-button" onClick={() => setImportResult(null)} aria-label="閉じる"><X size={18} /></button>
+            <div className="dialog-icon">{importResult.status === 'failure' ? <X size={20} /> : importResult.status === 'partial' ? <CircleHelp size={20} /> : <Check size={20} />}</div>
+            <div className="section-kicker">IMPORT RESULT</div>
+            <h2 id="import-result-title">
+              {importResult.status === 'success' && 'インポートに成功しました'}
+              {importResult.status === 'partial' && '端末には追加しましたが、同期に失敗しました'}
+              {importResult.status === 'nothing-new' && '追加する新しい地点はありませんでした'}
+              {importResult.status === 'failure' && 'インポートに失敗しました'}
+            </h2>
+            <p className="import-file">{importResult.fileName}{importResult.format ? `（${importResult.format}）` : ''}</p>
+            {importResult.status !== 'failure' && (
+              <dl className="import-stats">
+                <div><dt>ファイル内の地点</dt><dd>{(importResult.total ?? 0).toLocaleString()} 件</dd></div>
+                <div><dt>新しく追加</dt><dd><strong>{(importResult.added ?? 0).toLocaleString()} 件</strong></dd></div>
+                <div><dt>登録済みのためスキップ</dt><dd>{(importResult.duplicates ?? 0).toLocaleString()} 件</dd></div>
+                {!!importResult.skipped && <div><dt>日時がないため除外</dt><dd>{importResult.skipped.toLocaleString()} 件</dd></div>}
+                {importResult.firstAt && importResult.lastAt && (
+                  <div className="wide"><dt>記録の期間</dt><dd>{new Date(importResult.firstAt).toLocaleString('ja-JP')} 〜 {new Date(importResult.lastAt).toLocaleString('ja-JP')}</dd></div>
+                )}
+                {(importResult.added ?? 0) > 0 && (
+                  <div className="wide"><dt>アカウントへの同期</dt><dd>{importResult.syncError ? '失敗' : '完了（スプレッドシートに反映済み）'}</dd></div>
+                )}
+              </dl>
+            )}
+            {importResult.status === 'failure' && (
+              <div className="import-cause">
+                <strong>原因</strong>
+                <p>{importResult.cause}</p>
+                {importResult.hint && (<><strong>対処方法</strong><p>{importResult.hint}</p></>)}
+              </div>
+            )}
+            {importResult.status === 'partial' && (
+              <div className="import-cause">
+                <strong>同期できなかった原因</strong>
+                <p>{importResult.syncError}</p>
+                <strong>対処方法</strong>
+                <p>取り込んだ地点は端末に保存されています。通信状態を確認し、「アカウントに同期」を押して再度同期してください。</p>
+              </div>
+            )}
+            {importResult.status === 'nothing-new' && (
+              <p className="import-note">ファイル内の地点はすべて登録済みです。同じファイルを再度取り込んだ可能性があります。</p>
+            )}
+            <div className="import-actions">
+              {importResult.status === 'partial' && (
+                <button type="button" className="secondary-button" onClick={() => { setImportResult(null); void syncData() }} disabled={syncing}><Cloud size={16} />もう一度同期</button>
+              )}
+              {importResult.status === 'failure' && (
+                <button type="button" className="secondary-button" onClick={() => { setImportResult(null); timelineInputRef.current?.click() }}><FileUp size={16} />別のファイルを選ぶ</button>
+              )}
+              {(importResult.added ?? 0) > 0 ? (
+                <button type="button" className="primary-button" onClick={() => { setImportResult(null); setTab('map'); setMobileMenuOpen(false) }}><MapPin size={16} />地図で見る</button>
+              ) : (
+                <button type="button" className="primary-button" onClick={() => setImportResult(null)}>閉じる</button>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
       {showSaveDialog && (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSaveDialog(false) }}>
           <form className="save-dialog" onSubmit={addMemory}>

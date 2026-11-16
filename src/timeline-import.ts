@@ -3,6 +3,18 @@ import type { TrackPoint } from './types'
 export const MAX_IMPORTED_POINTS = 200_000
 
 type JsonRecord = Record<string, unknown>
+
+/** An import failure with a user-facing cause (message) and what to do about it (hint). */
+export class LocationImportError extends Error {
+  readonly hint?: string
+
+  constructor(message: string, hint?: string) {
+    super(message)
+    this.name = 'LocationImportError'
+    this.hint = hint
+  }
+}
+
 export type TimedLocation = { latitude: number; longitude: number; accuracy: number; recordedAt: string }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -63,7 +75,10 @@ export function pushLocation(output: TimedLocation[], latitude: number, longitud
   if (!isValidLatLng(latitude, longitude) || !Number.isFinite(time)) return
   output.push({ latitude, longitude, accuracy, recordedAt: new Date(time).toISOString() })
   if (output.length > MAX_IMPORTED_POINTS) {
-    throw new Error(`読み込めるGPS地点は${MAX_IMPORTED_POINTS.toLocaleString()}件までです`)
+    throw new LocationImportError(
+      `GPS地点が多すぎます（1ファイル${MAX_IMPORTED_POINTS.toLocaleString()}件まで）`,
+      '期間を区切ってエクスポートするか、ファイルを分割してから取り込んでください',
+    )
   }
 }
 
@@ -182,11 +197,14 @@ export function parseTimelinePoints(value: unknown): TrackPoint[] {
       for (const item of value.timelineObjects) parseTimelineObject(points, item)
     }
   } else {
-    throw new Error('JSONの形式を確認してください')
+    throw new LocationImportError('タイムラインJSONの形式ではありません', 'スマートフォンのGoogleマップ（タイムライン）からエクスポートしたJSONファイルか確認してください。Googleデータエクスポートの場合は「Semantic Location History」フォルダ内のJSONも選べます')
   }
 
   if (!points.length) {
-    throw new Error('GPS地点が見つかりません。Google MapsのタイムラインJSONを選択してください')
+    throw new LocationImportError(
+      'ファイル内にGPS地点（緯度・経度と日時）が見つかりませんでした',
+      'スマートフォンのGoogleマップ（タイムライン）からエクスポートしたJSONファイルか確認してください。Googleデータエクスポートの場合は「Semantic Location History」フォルダ内のJSONも選べます。タイムラインが空の期間をエクスポートした可能性もあります',
+    )
   }
   return finalizePoints(points)
 }
