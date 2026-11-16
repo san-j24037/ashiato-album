@@ -10,9 +10,12 @@ const MEMORY_HEADERS = [
   'driveFiles',
   'address',
   'isPublic',
-  'ownerName'
+  'ownerName',
+  'listId',
+  'mark'
 ];
 const LEGACY_SPOT_HEADERS = MEMORY_HEADERS.slice(0, 8);
+const LIST_HEADERS = ['userSub', 'id', 'name', 'mark', 'createdAt', 'updatedAt', 'deletedAt'];
 const USER_HEADERS = [
   'userId',
   'email',
@@ -93,18 +96,27 @@ function doPost(event) {
     }
     const points = incoming.points;
     const memories = incoming.memories;
-    if (points.length > 5000 || memories.length > 1000) {
+    // Older app versions do not send lists.
+    const lists = Array.isArray(incoming.lists) ? incoming.lists : [];
+    if (points.length > 5000 || memories.length > 1000 || lists.length > 500) {
       throw new Error('This sync batch exceeds the allowed record count');
     }
     if (!points.every(isValidPoint) || !memories.every(isValidMemory)) {
       throw new Error('Sync contains an invalid location or spot');
     }
+    if (!lists.every(isValidList)) {
+      throw new Error('Sync contains an invalid favorite list');
+    }
 
+    const listsSheet = getOrCreateSheet(spreadsheet, 'Lists', LIST_HEADERS);
     mergePoints(user.sub, pointsSheet, points);
     mergeMemories(user.sub, memoriesSheet, memories, user.name);
+    mergeLists(user.sub, listsSheet, lists);
+    const userData = readUserData(user.sub, pointsSheet, memoriesSheet);
+    userData.lists = readUserLists(user.sub, listsSheet);
     return jsonResponse({
       ok: true,
-      data: readUserData(user.sub, pointsSheet, memoriesSheet),
+      data: userData,
       recommendations: readPublicMemories(user.sub, memoriesSheet)
     });
   } catch (error) {
@@ -505,7 +517,9 @@ function mergeMemories(userSub, sheet, memories, ownerName) {
       JSON.stringify(Array.isArray(memory.driveFiles) ? memory.driveFiles : []),
       memory.address || '',
       memory.isPublic === true,
-      ownerName
+      ownerName,
+      memory.listId || '',
+      memory.mark ? JSON.stringify({ symbol: memory.mark.symbol, color: memory.mark.color }) : ''
     ];
     const existingRow = rowById.get(memory.id);
     if (existingRow) {
@@ -539,8 +553,81 @@ function readUserData(userSub, pointsSheet, memoriesSheet) {
       driveFiles: parseDriveFiles(row[7]),
       address: String(row[8] || ''),
       isPublic: row[9] === true,
+      listId: String(row[11] || ''),
+      mark: parseMark(row[12])
     }));
   return { points: points, memories: memories };
+}
+
+/** Lists are stored per user; a row is replaced only by a newer version (updatedAt). */
+function mergeLists(userSub, sheet, lists) {
+  if (!lists.length) return;
+  const rows = readSheet(sheet);
+  const rowById = new Map();
+  rows.slice(1).forEach((row, index) => {
+    if (String(row[0]) === userSub) rowById.set(String(row[1]), { row: index + 2, updatedAt: toIsoString(row[5]) });
+  });
+  const newRows = [];
+  lists.forEach(list => {
+    const values = [
+      userSub,
+      list.id,
+      list.name,
+      JSON.stringify({ symbol: list.mark.symbol, color: list.mark.color }),
+      list.createdAt,
+      list.updatedAt,
+      list.deletedAt || ''
+    ];
+    const existing = rowById.get(list.id);
+    if (!existing) {
+      newRows.push(values);
+      rowById.set(list.id, { row: -1, updatedAt: list.updatedAt });
+    } else if (existing.row > 0 && Date.parse(list.updatedAt) > Date.parse(existing.updatedAt)) {
+      sheet.getRange(existing.row, 1, 1, values.length).setValues([values]);
+    }
+  });
+  appendRows(sheet, newRows);
+}
+
+function readUserLists(userSub, sheet) {
+  return readSheet(sheet).slice(1)
+    .filter(row => String(row[0]) === userSub)
+    .map(row => {
+      const list = {
+        id: String(row[1]),
+        name: String(row[2]),
+        mark: parseMark(row[3]) || { symbol: '♥', color: '#d78072' },
+        createdAt: toIsoString(row[4]),
+        updatedAt: toIsoString(row[5])
+      };
+      if (row[6]) list.deletedAt = toIsoString(row[6]);
+      return list;
+    });
+}
+
+function parseMark(value) {
+  if (!value) return null;
+  try {
+    const mark = JSON.parse(String(value));
+    return isValidMark(mark) ? { symbol: mark.symbol, color: mark.color } : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function isValidMark(mark) {
+  return mark && typeof mark === 'object' &&
+    typeof mark.symbol === 'string' && mark.symbol.length > 0 && mark.symbol.length <= 8 &&
+    typeof mark.color === 'string' && /^#[0-9a-f]{6}$/i.test(mark.color);
+}
+
+function isValidList(list) {
+  return list && typeof list.id === 'string' && list.id.length > 0 && list.id.length <= 120 &&
+    typeof list.name === 'string' && list.name.length > 0 && list.name.length <= 80 &&
+    isValidMark(list.mark) &&
+    typeof list.createdAt === 'string' && !isNaN(Date.parse(list.createdAt)) &&
+    typeof list.updatedAt === 'string' && !isNaN(Date.parse(list.updatedAt)) &&
+    (list.deletedAt === undefined || (typeof list.deletedAt === 'string' && !isNaN(Date.parse(list.deletedAt))));
 }
 
 function readPublicMemories(userSub, sheet) {
@@ -678,7 +765,9 @@ function isValidMemory(memory) {
     Number.isFinite(memory.longitude) && memory.longitude >= -180 && memory.longitude <= 180 &&
     typeof memory.createdAt === 'string' && !isNaN(Date.parse(memory.createdAt)) &&
     Array.isArray(memory.driveFiles) && memory.driveFiles.length <= 100 &&
-    memory.driveFiles.every(isValidDriveFile);
+    memory.driveFiles.every(isValidDriveFile) &&
+    (memory.listId === undefined || (typeof memory.listId === 'string' && memory.listId.length <= 120)) &&
+    (memory.mark === undefined || memory.mark === null || isValidMark(memory.mark));
 }
 
 function isValidDriveFile(file) {

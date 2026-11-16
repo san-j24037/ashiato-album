@@ -42,7 +42,9 @@ import { AdminPage } from './AdminPage'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
 import { LOCATION_FILE_ACCEPT, parseLocationFile } from './location-import'
 import { LocationImportError } from './timeline-import'
-import { emptyAppData, type AppData, type Memory, type PublicMemory, type TrackPoint } from './types'
+import { emptyAppData, type AppData, type FavoriteList, type Mark, type Memory, type PublicMemory, type TrackPoint } from './types'
+import { DEFAULT_MARK, effectiveMark, escapeHtml } from './marks'
+import { ListEditorDialog, MarkBadge, MarkPicker } from './FavoriteLists'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined
@@ -121,24 +123,34 @@ function readMapStyle(): MapStyle {
   return savedStyle === 'terrain' || savedStyle === 'satellite' ? savedStyle : 'standard'
 }
 
+/** Upper bound of point circles drawn at once; more visible points are thinned out evenly. */
+const MAX_VISIBLE_POINT_MARKERS = 1500
+
 function updateSatelliteColorMask(map: L.Map, layer: L.TileLayer, points: TrackPoint[]) {
   const container = layer.getContainer()
   if (!container) return
 
   const mapBounds = map.getContainer().getBoundingClientRect()
-  const circles = points.map((point) => {
+  const visibleBounds = map.getBounds().pad(0.2)
+  const seen = new Set<string>()
+  const circles: { x: number; y: number; radius: number }[] = []
+  for (const point of points) {
+    if (!visibleBounds.contains([point.latitude, point.longitude])) continue
     const center = map.latLngToContainerPoint([point.latitude, point.longitude])
+    // Points that land on (almost) the same pixel add nothing to the mask.
+    const key = `${Math.round(center.x / 2)}:${Math.round(center.y / 2)}`
+    if (seen.has(key)) continue
+    seen.add(key)
     const targetLatitude = point.latitude > 89.999
       ? point.latitude - 20 / 111_320
       : point.latitude + 20 / 111_320
     const edge = map.latLngToContainerPoint([targetLatitude, point.longitude])
-    const radius = Math.max(Math.hypot(edge.x - center.x, edge.y - center.y), 0.5)
-    return {
+    circles.push({
       x: mapBounds.left + center.x,
       y: mapBounds.top + center.y,
-      radius,
-    }
-  })
+      radius: Math.max(Math.hypot(edge.x - center.x, edge.y - center.y), 0.5),
+    })
+  }
 
   container.querySelectorAll<HTMLImageElement>('.leaflet-tile').forEach((tile) => {
     const tileBounds = tile.getBoundingClientRect()
@@ -165,6 +177,7 @@ function updateSatelliteColorMask(map: L.Map, layer: L.TileLayer, points: TrackP
 function MapView({
   points,
   memories,
+  lists,
   recommendations,
   active,
   onSelect,
@@ -180,6 +193,7 @@ function MapView({
 }: {
   points: TrackPoint[]
   memories: Memory[]
+  lists: FavoriteList[]
   recommendations: PublicMemory[]
   active: boolean
   onSelect(memory: Memory): void
@@ -197,13 +211,20 @@ function MapView({
   const mapRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const satelliteColorLayerRef = useRef<L.TileLayer | null>(null)
-  const layerRef = useRef<L.LayerGroup | null>(null)
+  const rendererRef = useRef<L.Canvas | null>(null)
+  const trackLayerRef = useRef<L.LayerGroup | null>(null)
+  const pointLayerRef = useRef<L.LayerGroup | null>(null)
+  const memoryLayerRef = useRef<L.LayerGroup | null>(null)
+  const recommendationLayerRef = useRef<L.LayerGroup | null>(null)
+  const drawnTrackRef = useRef<{ line: L.Polyline | null; length: number; firstId?: string; lastId?: string } | null>(null)
   const userMarkerRef = useRef<L.CircleMarker | null>(null)
   const searchMarkerRef = useRef<L.Marker | null>(null)
   const lastCenteredIdRef = useRef<string | null>(null)
   const pointsRef = useRef(points)
   const [mapStyle, setMapStyle] = useState<MapStyle>(readMapStyle)
   const [searchQuery, setSearchQuery] = useState('')
+  // Circles for every GPS point are optional (off by default) because they are the heaviest layer.
+  const [showPointMarkers, setShowPointMarkers] = useState(false)
   const showTrackMarkings = active
     && !searchQuery.trim()
     && !searching
@@ -213,18 +234,26 @@ function MapView({
 
   useEffect(() => {
     if (!elementRef.current) return
-    const map = L.map(elementRef.current, { zoomControl: false, attributionControl: true })
+    // Canvas rendering keeps thousands of vectors fast (SVG creates one DOM node per shape).
+    const map = L.map(elementRef.current, { zoomControl: false, attributionControl: true, preferCanvas: true })
       .setView([35.6812, 139.7671], 13)
     L.control.zoom({ position: 'bottomright' }).addTo(map)
-    const layers = L.layerGroup().addTo(map)
+    rendererRef.current = L.canvas({ padding: 0.5, tolerance: 4 })
+    trackLayerRef.current = L.layerGroup().addTo(map)
+    pointLayerRef.current = L.layerGroup().addTo(map)
+    memoryLayerRef.current = L.layerGroup().addTo(map)
+    recommendationLayerRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
-    layerRef.current = layers
     map.on('click', (event: L.LeafletMouseEvent) => {
-      const nearest = [...pointsRef.current].reverse().find((point) => {
-        const distance = map.distance(event.latlng, [point.latitude, point.longitude])
-        return distance < 120
-      })
-      if (nearest) onAddPoint(nearest)
+      // Newest point within 120 m of the click (scans backwards without copying the array).
+      const current = pointsRef.current
+      for (let index = current.length - 1; index >= 0; index -= 1) {
+        const point = current[index]
+        if (map.distance(event.latlng, [point.latitude, point.longitude]) < 120) {
+          onAddPoint(point)
+          return
+        }
+      }
     })
     const resizeObserver = new ResizeObserver(() => map.invalidateSize({ pan: false }))
     resizeObserver.observe(elementRef.current)
@@ -234,7 +263,13 @@ function MapView({
       mapRef.current = null
       tileLayerRef.current = null
       satelliteColorLayerRef.current = null
-      layerRef.current = null
+      rendererRef.current = null
+      trackLayerRef.current = null
+      pointLayerRef.current = null
+      memoryLayerRef.current = null
+      recommendationLayerRef.current = null
+      drawnTrackRef.current = null
+      userMarkerRef.current = null
     }
   }, [onAddPoint])
 
@@ -281,76 +316,63 @@ function MapView({
     const colorLayer = satelliteColorLayerRef.current
     if (!map || !colorLayer || !showTrackMarkings) return
 
-    const updateMask = () => updateSatelliteColorMask(map, colorLayer, points)
+    let frame = 0
+    const updateMask = () => {
+      if (frame) return
+      frame = requestAnimationFrame(() => {
+        frame = 0
+        updateSatelliteColorMask(map, colorLayer, points)
+      })
+    }
     updateMask()
     map.on('moveend zoomend resize', updateMask)
     colorLayer.on('tileload', updateMask)
     return () => {
+      if (frame) cancelAnimationFrame(frame)
       map.off('moveend zoomend resize', updateMask)
       colorLayer.off('tileload', updateMask)
     }
   }, [points, mapStyle, showTrackMarkings])
 
+  // Route line + current-position marker. While recording, new points are appended to the
+  // existing polyline instead of redrawing the whole history.
   useEffect(() => {
     pointsRef.current = points
     const map = mapRef.current
-    const layers = layerRef.current
-    if (!map || !layers) return
-    layers.clearLayers()
-    if (points.length > 1) {
-      L.polyline(points.map((point) => [point.latitude, point.longitude]), {
-        color: '#397a69',
-        weight: 5,
-        opacity: 0.86,
-        lineCap: 'round',
-        lineJoin: 'round',
-      }).addTo(layers)
-    }
-    for (const point of points) {
-      if (showTrackMarkings && mapStyle !== 'satellite') {
-        L.circle([point.latitude, point.longitude], {
-          radius: 20,
-          color: '#397a69',
-          weight: 1,
-          opacity: 0.8,
-          fillColor: '#397a69',
-          fillOpacity: 0.16,
-        }).addTo(layers)
+    const trackLayer = trackLayerRef.current
+    if (!map || !trackLayer) return
+    const drawn = drawnTrackRef.current
+    const appendOnly = drawn?.line
+      && points.length > drawn.length
+      && points[0]?.id === drawn.firstId
+      && points[drawn.length - 1]?.id === drawn.lastId
+    let line = drawn?.line ?? null
+    if (appendOnly && line) {
+      for (let index = drawn.length; index < points.length; index += 1) {
+        line.addLatLng([points[index].latitude, points[index].longitude])
       }
-      L.circleMarker([point.latitude, point.longitude], {
-        radius: 5,
-        color: '#fff',
-        weight: 2,
-        fillColor: '#4b8978',
-        fillOpacity: 1,
-      })
-        .bindTooltip(new Date(point.recordedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }))
-        .addTo(layers)
+    } else {
+      trackLayer.clearLayers()
+      line = points.length > 1
+        ? L.polyline(points.map((point) => [point.latitude, point.longitude] as L.LatLngTuple), {
+            color: '#397a69',
+            weight: 5,
+            opacity: 0.86,
+            lineCap: 'round',
+            lineJoin: 'round',
+            smoothFactor: 1.5,
+            interactive: false,
+            renderer: rendererRef.current ?? undefined,
+          }).addTo(trackLayer)
+        : null
     }
-    for (const memory of memories) {
-      const icon = L.divIcon({
-        className: 'memory-marker',
-        html: '<span>♥</span>',
-        iconSize: [36, 42],
-        iconAnchor: [18, 38],
-      })
-      L.marker([memory.latitude, memory.longitude], { icon })
-        .bindTooltip(memory.title)
-        .on('click', () => onSelect(memory))
-        .addTo(layers)
+    drawnTrackRef.current = {
+      line,
+      length: points.length,
+      firstId: points[0]?.id,
+      lastId: points[points.length - 1]?.id,
     }
-    for (const memory of recommendations) {
-      const icon = L.divIcon({
-        className: 'recommendation-marker',
-        html: '<span>★</span>',
-        iconSize: [36, 42],
-        iconAnchor: [18, 38],
-      })
-      L.marker([memory.latitude, memory.longitude], { icon })
-        .bindTooltip(memory.title)
-        .on('click', () => onSelectRecommendation(memory))
-        .addTo(layers)
-    }
+
     const lastPoint = points[points.length - 1]
     if (lastPoint) {
       if (!userMarkerRef.current) {
@@ -360,6 +382,7 @@ function MapView({
           weight: 4,
           fillColor: '#438a75',
           fillOpacity: 1,
+          renderer: rendererRef.current ?? undefined,
         }).addTo(map)
       } else {
         userMarkerRef.current.setLatLng([lastPoint.latitude, lastPoint.longitude])
@@ -368,12 +391,105 @@ function MapView({
       userMarkerRef.current.remove()
       userMarkerRef.current = null
     }
-    if (points.length && points[points.length - 1].id !== lastCenteredIdRef.current) {
-      const latest = points[points.length - 1]
-      map.setView([latest.latitude, latest.longitude], Math.max(map.getZoom(), 14), { animate: true })
-      lastCenteredIdRef.current = latest.id
+    if (lastPoint && lastPoint.id !== lastCenteredIdRef.current) {
+      map.setView([lastPoint.latitude, lastPoint.longitude], Math.max(map.getZoom(), 14), { animate: true })
+      lastCenteredIdRef.current = lastPoint.id
     }
-  }, [points, memories, recommendations, onSelect, onSelectRecommendation, mapStyle, showTrackMarkings])
+  }, [points])
+
+  // Optional per-point circles: only those inside the visible area are drawn, thinned out
+  // evenly when there are more than MAX_VISIBLE_POINT_MARKERS, and redrawn after panning.
+  useEffect(() => {
+    const map = mapRef.current
+    const pointLayer = pointLayerRef.current
+    if (!map || !pointLayer) return
+    pointLayer.clearLayers()
+    if (!showPointMarkers) return
+    const renderer = rendererRef.current ?? undefined
+    const showRange = showTrackMarkings && mapStyle !== 'satellite'
+
+    const render = () => {
+      pointLayer.clearLayers()
+      const bounds = map.getBounds().pad(0.1)
+      const visible: TrackPoint[] = []
+      for (const point of points) {
+        if (bounds.contains([point.latitude, point.longitude])) visible.push(point)
+      }
+      const step = Math.max(1, Math.ceil(visible.length / MAX_VISIBLE_POINT_MARKERS))
+      const drawRange = showRange && map.getZoom() >= 15
+      for (let index = 0; index < visible.length; index += step) {
+        const point = visible[index]
+        if (drawRange) {
+          L.circle([point.latitude, point.longitude], {
+            radius: 20,
+            color: '#397a69',
+            weight: 1,
+            opacity: 0.8,
+            fillColor: '#397a69',
+            fillOpacity: 0.16,
+            interactive: false,
+            renderer,
+          }).addTo(pointLayer)
+        }
+        L.circleMarker([point.latitude, point.longitude], {
+          radius: 5,
+          color: '#fff',
+          weight: 2,
+          fillColor: '#4b8978',
+          fillOpacity: 1,
+          renderer,
+        })
+          .bindTooltip(() => new Date(point.recordedAt).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }))
+          .addTo(pointLayer)
+      }
+    }
+
+    render()
+    map.on('moveend', render)
+    return () => {
+      map.off('moveend', render)
+      pointLayer.clearLayers()
+    }
+  }, [points, showPointMarkers, showTrackMarkings, mapStyle])
+
+  useEffect(() => {
+    const memoryLayer = memoryLayerRef.current
+    if (!memoryLayer) return
+    memoryLayer.clearLayers()
+    const listsById = new Map(lists.map((list) => [list.id, list]))
+    for (const memory of memories) {
+      const mark = effectiveMark(memory, listsById)
+      const icon = L.divIcon({
+        className: 'memory-marker',
+        html: `<span style="background:${mark.color}"><i>${escapeHtml(mark.symbol)}</i></span>`,
+        iconSize: [36, 42],
+        iconAnchor: [18, 38],
+      })
+      const list = memory.listId ? listsById.get(memory.listId) : undefined
+      L.marker([memory.latitude, memory.longitude], { icon })
+        .bindTooltip(list && !list.deletedAt ? `${memory.title}（${list.name}）` : memory.title)
+        .on('click', () => onSelect(memory))
+        .addTo(memoryLayer)
+    }
+  }, [memories, lists, onSelect])
+
+  useEffect(() => {
+    const recommendationLayer = recommendationLayerRef.current
+    if (!recommendationLayer) return
+    recommendationLayer.clearLayers()
+    const icon = L.divIcon({
+      className: 'recommendation-marker',
+      html: '<span>★</span>',
+      iconSize: [36, 42],
+      iconAnchor: [18, 38],
+    })
+    for (const memory of recommendations) {
+      L.marker([memory.latitude, memory.longitude], { icon })
+        .bindTooltip(memory.title)
+        .on('click', () => onSelectRecommendation(memory))
+        .addTo(recommendationLayer)
+    }
+  }, [recommendations, onSelectRecommendation])
 
   useEffect(() => {
     if (centerRequest && mapRef.current) mapRef.current.setView(centerRequest, Math.max(mapRef.current.getZoom(), 14))
@@ -474,10 +590,18 @@ function MapView({
           航空写真
         </button>
       </div>
-      <div className="map-hint">
+      <button
+        type="button"
+        className={`map-hint map-point-toggle ${showPointMarkers ? 'on' : ''}`}
+        onClick={() => setShowPointMarkers((visible) => !visible)}
+        aria-pressed={showPointMarkers}
+        disabled={!points.length}
+        title={showPointMarkers ? '地点の〇を非表示にする' : '地点の〇を表示する（地点が多いと重くなります）'}
+      >
         <Compass size={15} />
         {points.length ? `${points.length.toLocaleString()}件の記録地点` : '旅の足跡がここに並びます'}
-      </div>
+        {points.length > 0 && <span className="toggle-pill">〇 {showPointMarkers ? '表示' : '非表示'}</span>}
+      </button>
     </div>
   )
 }
@@ -516,12 +640,20 @@ function App() {
   const [editSpotAddress, setEditSpotAddress] = useState('')
   const [editSpotNote, setEditSpotNote] = useState('')
   const [editSpotIsPublic, setEditSpotIsPublic] = useState(false)
+  const [editSpotListId, setEditSpotListId] = useState('')
+  const [editSpotMark, setEditSpotMark] = useState<Mark | null>(null)
+  // 'all' | 'none' (favorites without a list) | a list id
+  const [listFilter, setListFilter] = useState('all')
+  const listFilterRef = useRef('all')
+  const [listEditor, setListEditor] = useState<{ list: FavoriteList | null } | null>(null)
   const [selectedPoint, setSelectedPoint] = useState<TrackPoint | null>(null)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
   const [spotTitle, setSpotTitle] = useState('')
   const [spotAddress, setSpotAddress] = useState('')
   const [spotNote, setSpotNote] = useState('')
   const [spotIsPublic, setSpotIsPublic] = useState(false)
+  const [spotListId, setSpotListId] = useState('')
+  const [spotMark, setSpotMark] = useState<Mark | null>(null)
   const [nativeWatcherId, setNativeWatcherId] = useState<string | null>(null)
   const nativeWatcherRef = useRef<string | null>(null)
   const [hasSynced, setHasSynced] = useState(false)
@@ -679,7 +811,15 @@ function App() {
     setSpotAddress('')
     setSpotNote('')
     setSpotIsPublic(false)
+    // New favorites go into the list currently shown in the favorites tab.
+    const filter = listFilterRef.current
+    setSpotListId(filter !== 'all' && filter !== 'none' ? filter : '')
+    setSpotMark(null)
   }, [])
+
+  useEffect(() => {
+    listFilterRef.current = listFilter
+  }, [listFilter])
 
   const onSelectMemory = useCallback((memory: Memory) => {
     setSelectedRecommendation(null)
@@ -688,6 +828,8 @@ function App() {
     setEditSpotAddress(memory.address ?? '')
     setEditSpotNote(memory.note)
     setEditSpotIsPublic(memory.isPublic ?? false)
+    setEditSpotListId(memory.listId ?? '')
+    setEditSpotMark(memory.mark ?? null)
   }, [])
 
   const onSelectRecommendation = useCallback((memory: PublicMemory) => {
@@ -870,6 +1012,8 @@ function App() {
       address: spotAddress.trim(),
       note: spotNote.trim(),
       isPublic: spotIsPublic,
+      listId: spotListId,
+      mark: spotMark,
       latitude: selectedPoint.latitude,
       longitude: selectedPoint.longitude,
       createdAt: new Date().toISOString(),
@@ -891,6 +1035,8 @@ function App() {
       address: editSpotAddress.trim(),
       note: editSpotNote.trim(),
       isPublic: editSpotIsPublic,
+      listId: editSpotListId,
+      mark: editSpotMark,
     }
     const nextData = {
       ...data,
@@ -899,6 +1045,38 @@ function App() {
     setData(nextData)
     setSelectedMemory(updatedMemory)
     setMessage('お気に入り情報を保存しています')
+    void syncData(nextData)
+  }
+
+  const saveList = (name: string, mark: Mark) => {
+    const now = new Date().toISOString()
+    const editing = listEditor?.list
+    const saved: FavoriteList = editing
+      ? { ...editing, name, mark, updatedAt: now }
+      : { id: crypto.randomUUID(), name, mark, createdAt: now, updatedAt: now }
+    const nextData: AppData = {
+      ...data,
+      lists: editing ? data.lists.map((list) => list.id === saved.id ? saved : list) : [...data.lists, saved],
+    }
+    setData(nextData)
+    setListEditor(null)
+    if (!editing) setListFilter(saved.id)
+    void syncData(nextData)
+  }
+
+  const deleteList = (target: FavoriteList) => {
+    const now = new Date().toISOString()
+    // Keep a tombstone so other devices learn about the deletion; favorites move to "未分類".
+    const nextData: AppData = {
+      ...data,
+      lists: data.lists.map((list) => list.id === target.id ? { ...list, deletedAt: now, updatedAt: now } : list),
+      memories: data.memories.map((memory) => memory.listId === target.id ? { ...memory, listId: '' } : memory),
+    }
+    setData(nextData)
+    setListEditor(null)
+    setListFilter('all')
+    if (selectedMemory?.listId === target.id) setSelectedMemory({ ...selectedMemory, listId: '' })
+    if (editSpotListId === target.id) setEditSpotListId('')
     void syncData(nextData)
   }
 
@@ -991,7 +1169,8 @@ function App() {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ data: { points: pointBatch, memories: memoryBatch } }),
+          // Lists are small, so they travel with the first batch only.
+          body: JSON.stringify({ data: { points: pointBatch, memories: memoryBatch, lists: index === 0 ? uploadData.lists : [] } }),
         })
         const responseText = await response.text()
         let result: SyncResponse
@@ -1009,7 +1188,13 @@ function App() {
       if (remoteData) {
         const points = new Map([...remoteData.points, ...uploadData.points].map((point) => [point.id, point]))
         const memories = new Map([...remoteData.memories, ...uploadData.memories].map((memory) => [memory.id, memory]))
-        synchronizedData = { points: [...points.values()], memories: [...memories.values()] }
+        // A list edited on several devices keeps its newest version (deletions included).
+        const lists = new Map<string, FavoriteList>()
+        for (const list of [...(remoteData.lists ?? []), ...uploadData.lists]) {
+          const current = lists.get(list.id)
+          if (!current || Date.parse(list.updatedAt) >= Date.parse(current.updatedAt)) lists.set(list.id, list)
+        }
+        synchronizedData = { points: [...points.values()], memories: [...memories.values()], lists: [...lists.values()] }
         setRecommendations(remoteRecommendations)
       }
       if (synchronizedData) setData(synchronizedData)
@@ -1110,7 +1295,33 @@ function App() {
     searchAbortRef.current?.abort()
   }, [])
 
-  const recentMemories = useMemo(() => [...data.memories].reverse(), [data.memories])
+  const activeLists = useMemo(
+    () => data.lists.filter((list) => !list.deletedAt).sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+    [data.lists],
+  )
+  const listsById = useMemo(() => new Map(data.lists.map((list) => [list.id, list])), [data.lists])
+  const isInActiveList = useCallback((memory: Memory) => {
+    const list = memory.listId ? listsById.get(memory.listId) : undefined
+    return !!list && !list.deletedAt
+  }, [listsById])
+  const filteredMemories = useMemo(() => {
+    if (listFilter === 'all') return data.memories
+    if (listFilter === 'none') return data.memories.filter((memory) => !isInActiveList(memory))
+    return data.memories.filter((memory) => memory.listId === listFilter)
+  }, [data.memories, listFilter, isInActiveList])
+  const recentMemories = useMemo(() => [...filteredMemories].reverse(), [filteredMemories])
+  const listCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const memory of data.memories) {
+      const key = isInActiveList(memory) ? memory.listId ?? '' : 'none'
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return counts
+  }, [data.memories, isInActiveList])
+  const selectedList = activeLists.find((list) => list.id === listFilter) ?? null
+  const listMarkFor = (listId: string) => activeLists.find((list) => list.id === listId)?.mark ?? DEFAULT_MARK
+  // On the favorites tab, the map follows the chosen list.
+  const mapMemories = tab === 'spots' && listFilter !== 'all' ? filteredMemories : data.memories
   const pointForSpot = selectedPoint ?? data.points[data.points.length - 1]
   const latestDate = data.points.at(-1)?.recordedAt
 
@@ -1539,14 +1750,43 @@ function App() {
               </>
             ) : (
               <div className="memories-list">
-                {recentMemories.map((memory) => (
-                  <button className="memory-card" key={memory.id} onClick={() => setSelectedMemory(memory)}>
-                    <span className="memory-card-icon"><Heart size={17} fill="currentColor" /></span>
-                    <span className="memory-card-text"><strong>{memory.title}</strong><small>{memory.address || memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{memory.isPublic ? 'おすすめとして公開中' : memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
+                <div className="list-filter" role="group" aria-label="リストで絞り込み">
+                  <button type="button" className={listFilter === 'all' ? 'selected' : ''} aria-pressed={listFilter === 'all'} onClick={() => setListFilter('all')}>
+                    すべて<span className="chip-count">{data.memories.length}</span>
+                  </button>
+                  {activeLists.map((list) => (
+                    <button type="button" key={list.id} className={listFilter === list.id ? 'selected' : ''} aria-pressed={listFilter === list.id} onClick={() => setListFilter(list.id)}>
+                      <MarkBadge mark={list.mark} size={18} />{list.name}<span className="chip-count">{listCounts.get(list.id) ?? 0}</span>
+                    </button>
+                  ))}
+                  {(listCounts.get('none') ?? 0) > 0 && activeLists.length > 0 && (
+                    <button type="button" className={listFilter === 'none' ? 'selected' : ''} aria-pressed={listFilter === 'none'} onClick={() => setListFilter('none')}>
+                      未分類<span className="chip-count">{listCounts.get('none')}</span>
+                    </button>
+                  )}
+                  <button type="button" className="list-add" onClick={() => setListEditor({ list: null })}><Plus size={13} />リスト</button>
+                </div>
+                {selectedList && (
+                  <div className="list-header">
+                    <MarkBadge mark={selectedList.mark} size={30} />
+                    <span><strong>{selectedList.name}</strong><small>{listCounts.get(selectedList.id) ?? 0}件のお気に入り</small></span>
+                    <button type="button" className="secondary-button" onClick={() => setListEditor({ list: selectedList })}>編集</button>
+                  </div>
+                )}
+                {recentMemories.map((memory) => {
+                  const mark = effectiveMark(memory, listsById)
+                  const list = isInActiveList(memory) ? listsById.get(memory.listId ?? '') : undefined
+                  return (
+                  <button className="memory-card" key={memory.id} onClick={() => onSelectMemory(memory)}>
+                    <MarkBadge mark={mark} size={34} />
+                    <span className="memory-card-text"><strong>{memory.title}</strong>{list && listFilter === 'all' && <small className="memory-card-list">{list.name}</small>}<small>{memory.address || memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{memory.isPublic ? 'おすすめとして公開中' : memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
                     <ChevronDown size={16} className="memory-chevron" />
                   </button>
-                ))}
-                {!recentMemories.length && <div className="empty-points"><div className="empty-icon"><Heart size={22} /></div><strong>とっておきの場所を残そう</strong><span>記録した地点から、好きな場所をスポットにできます。</span></div>}
+                  )
+                })}
+                {!recentMemories.length && (listFilter === 'all'
+                  ? <div className="empty-points"><div className="empty-icon"><Heart size={22} /></div><strong>とっておきの場所を残そう</strong><span>記録した地点から、好きな場所をスポットにできます。</span></div>
+                  : <div className="empty-points"><div className="empty-icon"><Heart size={22} /></div><strong>このリストはまだ空です</strong><span>お気に入りの詳細画面で、リストを選んで追加できます。</span></div>)}
               </div>
             )}
             <div className="sidebar-spacer" />
@@ -1571,7 +1811,8 @@ function App() {
         </header>
         <MapView
           points={data.points}
-          memories={data.memories}
+          memories={mapMemories}
+          lists={data.lists}
           recommendations={recommendations}
           active={active}
           onSelect={onSelectMemory}
@@ -1622,6 +1863,14 @@ function App() {
                 <input type="checkbox" checked={editSpotIsPublic} onChange={(event) => setEditSpotIsPublic(event.target.checked)} />
                 <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
               </label>
+              <label className="field-label">リスト
+                <select className="text-field" value={editSpotListId} onChange={(event) => setEditSpotListId(event.target.value)}>
+                  <option value="">未分類</option>
+                  {activeLists.map((list) => <option key={list.id} value={list.id}>{list.mark.symbol} {list.name}</option>)}
+                </select>
+              </label>
+              <span className="field-label">マーク</span>
+              <MarkPicker value={editSpotMark} onChange={setEditSpotMark} inheritFrom={listMarkFor(editSpotListId)} />
               <button className="primary-button full-button" type="submit" disabled={syncing}><Check size={16} />変更を保存</button>
             </form>
             <div className="detail-coordinate">{selectedMemory.latitude.toFixed(5)}°, {selectedMemory.longitude.toFixed(5)}°</div>
@@ -1732,6 +1981,16 @@ function App() {
           </section>
         </div>
       )}
+      {listEditor && (
+        <ListEditorDialog
+          key={listEditor.list?.id ?? 'new'}
+          list={listEditor.list}
+          favoriteCount={listEditor.list ? listCounts.get(listEditor.list.id) ?? 0 : 0}
+          onSave={saveList}
+          onDelete={() => { if (listEditor.list) deleteList(listEditor.list) }}
+          onClose={() => setListEditor(null)}
+        />
+      )}
       {showSaveDialog && (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSaveDialog(false) }}>
           <form className="save-dialog" onSubmit={addMemory}>
@@ -1748,9 +2007,16 @@ function App() {
             <label className="field-label" htmlFor="spot-note">説明 <span>任意</span></label>
             <textarea id="spot-note" className="text-field note-field" value={spotNote} maxLength={2000} onChange={(event) => setSpotNote(event.target.value)} placeholder="場所のおすすめポイントや思い出" rows={3} />
             <label className="visibility-option">
-              <input type="checkbox" checked={spotIsPublic} onChange={(event) => setSpotIsPublic(event.target.checked)} />
+                <input type="checkbox" checked={spotIsPublic} onChange={(event) => setSpotIsPublic(event.target.checked)} />
               <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
             </label>
+            <label className="field-label" htmlFor="spot-list">リスト</label>
+            <select id="spot-list" className="text-field" value={spotListId} onChange={(event) => setSpotListId(event.target.value)}>
+              <option value="">未分類</option>
+              {activeLists.map((list) => <option key={list.id} value={list.id}>{list.mark.symbol} {list.name}</option>)}
+            </select>
+            <span className="field-label">マーク</span>
+            <MarkPicker value={spotMark} onChange={setSpotMark} inheritFrom={listMarkFor(spotListId)} />
             <button className="primary-button full-button" type="submit" disabled={syncing}><Heart size={17} />スポットに保存</button>
           </form>
         </div>
