@@ -12,6 +12,7 @@ const MEMORY_HEADERS = [
   'isPublic',
   'ownerName'
 ];
+const LEGACY_SPOT_HEADERS = MEMORY_HEADERS.slice(0, 8);
 const USER_HEADERS = [
   'userId',
   'email',
@@ -21,10 +22,21 @@ const USER_HEADERS = [
   'createdAt',
   'lastLoginAt',
   'failedAttempts',
-  'lockedUntil'
+  'lockedUntil',
+  'resetCodeHash',
+  'resetExpiresAt',
+  'resetAttempts',
+  'resetRequestedAt'
 ];
 const MAX_LOGIN_FAILURES = 5;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const RESET_CODE_TTL_MS = 15 * 60 * 1000;
+const RESET_RESEND_INTERVAL_MS = 60 * 1000;
+const MAX_RESET_ATTEMPTS = 5;
+// Stop sending reset mail while this many messages of the daily MailApp quota still remain,
+// so the free-tier limit (about 100/day) is never actually exceeded.
+const MAIL_QUOTA_RESERVE = 5;
+const ADMIN_DETAIL_POINT_LIMIT = 2000;
 
 function doPost(event) {
   let lock;
@@ -50,10 +62,26 @@ function doPost(event) {
     if (body.action === 'accountLoginSuccess') {
       return jsonResponse(recordLoginSuccess(usersSheet, body.email));
     }
+    if (body.action === 'passwordResetRequest') {
+      return jsonResponse(requestPasswordReset(usersSheet, body.email));
+    }
+    if (body.action === 'passwordResetConfirm') {
+      return jsonResponse(confirmPasswordReset(usersSheet, body));
+    }
 
     const user = verifySessionToken(body.sessionToken);
     const pointsSheet = getOrCreateSheet(spreadsheet, 'Points', POINT_HEADERS);
-    const memoriesSheet = getOrCreateSheet(spreadsheet, 'Spots', MEMORY_HEADERS);
+    const memoriesSheet = getOrCreateSheet(spreadsheet, 'Favorites', MEMORY_HEADERS);
+    migrateLegacySpots(spreadsheet, memoriesSheet);
+
+    // Admin actions: Pages Functions has already checked that the session belongs to an
+    // address listed in ADMIN_EMAILS; GAS additionally requires the valid session above.
+    if (body.action === 'adminListUsers') {
+      return jsonResponse(adminListUsers(usersSheet, pointsSheet, memoriesSheet));
+    }
+    if (body.action === 'adminUserDetail') {
+      return jsonResponse(adminUserDetail(usersSheet, pointsSheet, memoriesSheet, body.userId));
+    }
 
     if (body.action !== 'sync') {
       throw new Error('Unsupported action');
@@ -187,6 +215,10 @@ function registerAccount(sheet, body) {
     new Date(),
     '',
     0,
+    0,
+    '',
+    0,
+    0,
     0
   ]]);
   return { ok: true };
@@ -235,6 +267,106 @@ function recordLoginSuccess(sheet, emailValue) {
   }
   sheet.getRange(user.row, 7, 1, 3).setValues([[new Date(), 0, 0]]);
   return { ok: true };
+}
+
+function requestPasswordReset(sheet, emailValue) {
+  if (!isValidEmail(emailValue)) throw new Error('Email is invalid');
+  // Checked before the user lookup so the answer does not depend on whether the address exists.
+  if (MailApp.getRemainingDailyQuota() <= MAIL_QUOTA_RESERVE) {
+    return { ok: false, code: 'MAIL_QUOTA_EXCEEDED' };
+  }
+  const user = findUserRow(sheet, emailValue);
+  // Respond identically whether or not the address is registered.
+  if (!user) return { ok: true };
+  const now = Date.now();
+  if (now - toTimestamp(user.values[12]) < RESET_RESEND_INTERVAL_MS) return { ok: true };
+
+  const userId = String(user.values[0]);
+  const code = generateResetCode();
+  sheet.getRange(user.row, 10, 1, 4).setValues([[
+    hashResetCode(userId, code),
+    now + RESET_CODE_TTL_MS,
+    0,
+    now
+  ]]);
+  SpreadsheetApp.flush();
+
+  const displayName = String(user.values[2]);
+  MailApp.sendEmail({
+    to: String(user.values[1]),
+    subject: '【ashiato】パスワード再設定の確認コード',
+    body: [
+      displayName + ' 様',
+      '',
+      'ashiato のパスワード再設定が申請されました。',
+      'アプリの再設定画面で、次のワンタイムパスワードを入力してください。',
+      '',
+      '    ワンタイムパスワード: ' + code,
+      '',
+      '有効期限は発行から' + (RESET_CODE_TTL_MS / 60000) + '分です。',
+      'このコードは誰にも教えないでください。',
+      '',
+      'お心当たりがない場合は、このメールを破棄してください。パスワードは変更されません。'
+    ].join('\n'),
+    name: 'ashiato'
+  });
+  return { ok: true };
+}
+
+function confirmPasswordReset(sheet, body) {
+  if (
+    !isValidEmail(body.email) ||
+    !/^[0-9]{6}$/.test(String(body.code || '')) ||
+    !/^[A-Za-z0-9_-]{22}$/.test(body.passwordSalt || '') ||
+    !/^[A-Za-z0-9_-]{43}$/.test(body.passwordHash || '')
+  ) {
+    throw new Error('Password reset data is invalid');
+  }
+  const user = findUserRow(sheet, body.email);
+  if (!user) return { ok: false, code: 'RESET_INVALID' };
+
+  const storedHash = String(user.values[9] || '');
+  const expiresAt = toTimestamp(user.values[10]);
+  const attempts = Number(user.values[11]) || 0;
+  if (!storedHash || expiresAt <= Date.now() || attempts >= MAX_RESET_ATTEMPTS) {
+    if (storedHash) sheet.getRange(user.row, 10, 1, 3).setValues([['', 0, 0]]);
+    return { ok: false, code: 'RESET_INVALID' };
+  }
+
+  const userId = String(user.values[0]);
+  if (!constantTimeEquals(hashResetCode(userId, body.code), storedHash)) {
+    const nextAttempts = attempts + 1;
+    if (nextAttempts >= MAX_RESET_ATTEMPTS) {
+      sheet.getRange(user.row, 10, 1, 3).setValues([['', 0, 0]]);
+    } else {
+      sheet.getRange(user.row, 12).setValue(nextAttempts);
+    }
+    return { ok: false, code: 'RESET_INVALID' };
+  }
+
+  sheet.getRange(user.row, 4, 1, 2).setValues([[body.passwordSalt, body.passwordHash]]);
+  sheet.getRange(user.row, 8, 1, 5).setValues([[0, 0, '', 0, 0]]);
+  return {
+    ok: true,
+    user: {
+      userId: userId,
+      email: String(user.values[1]),
+      displayName: String(user.values[2])
+    }
+  };
+}
+
+function generateResetCode() {
+  // Utilities.getUuid() returns a random (v4) UUID; use 40 of its random bits.
+  const hex = Utilities.getUuid().replace(/-/g, '').slice(0, 10);
+  return String(parseInt(hex, 16) % 1000000).padStart(6, '0');
+}
+
+function hashResetCode(userId, code) {
+  const secret = PropertiesService.getScriptProperties().getProperty('APP_SESSION_SECRET');
+  if (!secret) throw new Error('APP_SESSION_SECRET is not configured');
+  const bytes = Utilities.computeHmacSha256Signature('password-reset:' + userId + ':' + code, secret);
+  return 'h:' + bytes.map(byte => ('0' + (byte & 0xff).toString(16)).slice(-2)).join('');
 }
 
 function findUserRow(sheet, emailValue) {
@@ -288,6 +420,44 @@ function getOrCreateSheet(spreadsheet, name, headers) {
     }
   }
   return sheet;
+}
+
+function migrateLegacySpots(spreadsheet, favoritesSheet) {
+  const legacySheet = spreadsheet.getSheetByName('Spots');
+  if (!legacySheet || legacySheet.getLastRow() === 0) return;
+
+  const legacyRows = readSheet(legacySheet);
+  const legacyHeaders = legacyRows[0];
+  if (
+    legacyHeaders.length < LEGACY_SPOT_HEADERS.length ||
+    LEGACY_SPOT_HEADERS.some((header, index) => legacyHeaders[index] !== header)
+  ) {
+    throw new Error('The legacy Spots sheet has unexpected columns and could not be migrated');
+  }
+
+  const existingKeys = new Set(
+    readSheet(favoritesSheet).slice(1).map(row => String(row[0]) + ':' + String(row[1]))
+  );
+  const rowsToMigrate = [];
+  legacyRows.slice(1).forEach(row => {
+    const key = String(row[0]) + ':' + String(row[1]);
+    if (existingKeys.has(key)) return;
+    existingKeys.add(key);
+    rowsToMigrate.push([
+      row[0],
+      row[1],
+      row[2],
+      row[3],
+      row[4],
+      row[5],
+      row[6],
+      row[7],
+      row[8] || '',
+      row[9] === true,
+      row[10] || ''
+    ]);
+  });
+  appendRows(favoritesSheet, rowsToMigrate);
 }
 
 function mergePoints(userSub, sheet, points) {
@@ -376,6 +546,81 @@ function readPublicMemories(userSub, sheet) {
       isPublic: true,
       ownerName: String(row[10] || 'ユーザー')
     }));
+}
+
+function adminUserSummary(row) {
+  return {
+    userId: String(row[0]),
+    email: String(row[1]),
+    displayName: String(row[2]),
+    createdAt: row[5] ? toIsoString(row[5]) : '',
+    lastLoginAt: row[6] ? toIsoString(row[6]) : '',
+    failedAttempts: Number(row[7]) || 0,
+    lockedUntil: toTimestamp(row[8])
+  };
+}
+
+function adminListUsers(usersSheet, pointsSheet, memoriesSheet) {
+  const stats = new Map();
+  const statFor = userSub => {
+    if (!stats.has(userSub)) {
+      stats.set(userSub, { pointCount: 0, lastPointAt: '', favoriteCount: 0, publicFavoriteCount: 0 });
+    }
+    return stats.get(userSub);
+  };
+  readSheet(pointsSheet).slice(1).forEach(row => {
+    const stat = statFor(String(row[0]));
+    stat.pointCount += 1;
+    const recordedAt = toIsoString(row[5]);
+    if (recordedAt > stat.lastPointAt) stat.lastPointAt = recordedAt;
+  });
+  readSheet(memoriesSheet).slice(1).forEach(row => {
+    const stat = statFor(String(row[0]));
+    stat.favoriteCount += 1;
+    if (row[9] === true) stat.publicFavoriteCount += 1;
+  });
+
+  const users = readSheet(usersSheet).slice(1)
+    .filter(row => String(row[0]))
+    .map(row => {
+      const summary = adminUserSummary(row);
+      const stat = stats.get(summary.userId) || statFor(summary.userId);
+      return Object.assign(summary, stat);
+    });
+  return {
+    ok: true,
+    users: users,
+    mailQuotaRemaining: MailApp.getRemainingDailyQuota(),
+    mailQuotaReserve: MAIL_QUOTA_RESERVE
+  };
+}
+
+function adminUserDetail(usersSheet, pointsSheet, memoriesSheet, userId) {
+  if (typeof userId !== 'string' || !/^[a-f0-9-]{36}$/i.test(userId)) {
+    throw new Error('User id is invalid');
+  }
+  const userRow = readSheet(usersSheet).slice(1).find(row => String(row[0]) === userId);
+  if (!userRow) return { ok: false, code: 'USER_NOT_FOUND' };
+
+  const data = readUserData(userId, pointsSheet, memoriesSheet);
+  const points = data.points.sort((a, b) => (a.recordedAt < b.recordedAt ? 1 : a.recordedAt > b.recordedAt ? -1 : 0));
+  return {
+    ok: true,
+    user: adminUserSummary(userRow),
+    pointCount: points.length,
+    points: points.slice(0, ADMIN_DETAIL_POINT_LIMIT),
+    favorites: data.memories.map(memory => ({
+      id: memory.id,
+      title: memory.title,
+      note: memory.note,
+      address: memory.address,
+      latitude: memory.latitude,
+      longitude: memory.longitude,
+      createdAt: memory.createdAt,
+      isPublic: memory.isPublic,
+      fileCount: memory.driveFiles.length
+    }))
+  };
 }
 
 function toIsoString(value) {

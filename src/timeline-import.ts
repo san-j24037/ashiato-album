@@ -1,81 +1,80 @@
 import type { TrackPoint } from './types'
 
-const MAX_IMPORTED_POINTS = 200_000
+export const MAX_IMPORTED_POINTS = 200_000
 
 type JsonRecord = Record<string, unknown>
-type TimedLocation = { latitude: number; longitude: number; accuracy: number; recordedAt: string }
+export type TimedLocation = { latitude: number; longitude: number; accuracy: number; recordedAt: string }
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function parseTimestamp(value: unknown): number | null {
+export function parseTimestamp(value: unknown): number | null {
   if (typeof value === 'number' || (typeof value === 'string' && /^\d{10,13}$/.test(value))) {
     const numeric = Number(value)
     if (!Number.isFinite(numeric)) return null
     const milliseconds = numeric < 100_000_000_000 ? numeric * 1000 : numeric
     return Number.isFinite(new Date(milliseconds).getTime()) ? milliseconds : null
   }
-  if (typeof value !== 'string') return null
-  const parsed = Date.parse(value)
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = Date.parse(value.trim())
   return Number.isFinite(parsed) ? parsed : null
 }
 
+export function isValidLatLng(latitude: number, longitude: number): boolean {
+  return Number.isFinite(latitude) && latitude >= -90 && latitude <= 90
+    && Number.isFinite(longitude) && longitude >= -180 && longitude <= 180
+}
+
+/** Parses "geo:35.1,139.2", "35.1°, 139.2°" or "35.1,139.2". */
+function parseCoordinateString(value: string): [number, number] | null {
+  const match = /^\s*(?:geo:\s*)?(-?\d+(?:\.\d+)?)\s*°?\s*,\s*(-?\d+(?:\.\d+)?)\s*°?/i.exec(value)
+  if (!match) return null
+  const latitude = Number(match[1])
+  const longitude = Number(match[2])
+  return isValidLatLng(latitude, longitude) ? [latitude, longitude] : null
+}
+
 function parseCoordinate(value: unknown): [number, number] | null {
+  if (typeof value === 'string') return parseCoordinateString(value)
   if (!isRecord(value)) return null
-  let latitude: number
-  let longitude: number
-  if (typeof value.point === 'string') {
-    const match = /^geo:\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/i.exec(value.point)
-    if (!match) return null
-    latitude = Number(match[1])
-    longitude = Number(match[2])
-  } else {
-    const latitudeValue = value.latitude ?? value.lat ?? value.latitudeE7 ?? value.latE7
-    const longitudeValue = value.longitude ?? value.lng ?? value.longitudeE7 ?? value.lngE7
-    if (typeof latitudeValue !== 'number' || typeof longitudeValue !== 'number') return null
-    const isE7 = 'latitudeE7' in value || 'longitudeE7' in value || 'latE7' in value || 'lngE7' in value
-    latitude = isE7 ? latitudeValue / 10_000_000 : latitudeValue
-    longitude = isE7 ? longitudeValue / 10_000_000 : longitudeValue
+  for (const key of ['point', 'latLng', 'LatLng', 'placeLocation']) {
+    const nested = value[key]
+    if (typeof nested === 'string' || isRecord(nested)) {
+      const parsed = parseCoordinate(nested)
+      if (parsed) return parsed
+    }
   }
-  if (
-    !Number.isFinite(latitude) || latitude < -90 || latitude > 90
-    || !Number.isFinite(longitude) || longitude < -180 || longitude > 180
-  ) return null
-  return [latitude, longitude]
+  const latitudeValue = value.latitude ?? value.lat ?? value.latitudeE7 ?? value.latE7
+  const longitudeValue = value.longitude ?? value.lng ?? value.longitudeE7 ?? value.lngE7
+  if (typeof latitudeValue !== 'number' || typeof longitudeValue !== 'number') return null
+  const isE7 = 'latitudeE7' in value || 'longitudeE7' in value || 'latE7' in value || 'lngE7' in value
+  const latitude = isE7 ? latitudeValue / 10_000_000 : latitudeValue
+  const longitude = isE7 ? longitudeValue / 10_000_000 : longitudeValue
+  return isValidLatLng(latitude, longitude) ? [latitude, longitude] : null
 }
 
 function accuracyOf(record: JsonRecord): number {
-  const accuracy = record.accuracy ?? record.accuracyMeters
-  return typeof accuracy === 'number' && Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : 0
+  const accuracy = Number(record.accuracy ?? record.accuracyMeters)
+  return Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : 0
 }
 
-function addPoint(
-  output: TimedLocation[],
-  coordinate: unknown,
-  timestamp: unknown,
-  accuracy = 0,
-) {
-  const parsedCoordinate = parseCoordinate(coordinate)
-  const time = parseTimestamp(timestamp)
-  if (!parsedCoordinate || time === null) return
-  output.push({
-    latitude: parsedCoordinate[0],
-    longitude: parsedCoordinate[1],
-    accuracy,
-    recordedAt: new Date(time).toISOString(),
-  })
+export function pushLocation(output: TimedLocation[], latitude: number, longitude: number, time: number, accuracy = 0) {
+  if (!isValidLatLng(latitude, longitude) || !Number.isFinite(time)) return
+  output.push({ latitude, longitude, accuracy, recordedAt: new Date(time).toISOString() })
   if (output.length > MAX_IMPORTED_POINTS) {
     throw new Error(`読み込めるGPS地点は${MAX_IMPORTED_POINTS.toLocaleString()}件までです`)
   }
 }
 
-function addWaypointPath(
-  output: TimedLocation[],
-  waypoints: unknown,
-  startTime: unknown,
-  endTime: unknown,
-) {
+function addPoint(output: TimedLocation[], coordinate: unknown, timestamp: unknown, accuracy = 0) {
+  const parsedCoordinate = parseCoordinate(coordinate)
+  const time = parseTimestamp(timestamp)
+  if (!parsedCoordinate || time === null) return
+  pushLocation(output, parsedCoordinate[0], parsedCoordinate[1], time, accuracy)
+}
+
+function addWaypointPath(output: TimedLocation[], waypoints: unknown, startTime: unknown, endTime: unknown) {
   if (!Array.isArray(waypoints) || !waypoints.length) return
   const start = parseTimestamp(startTime)
   const end = parseTimestamp(endTime)
@@ -115,45 +114,90 @@ function parseTimelineObject(output: TimedLocation[], value: unknown) {
   }
 }
 
-export function parseTimelinePoints(value: unknown): TrackPoint[] {
-  if (!isRecord(value)) throw new Error('JSONの形式を確認してください')
+/**
+ * On-device Timeline segment (Android "semanticSegments" item, or an element of the
+ * top-level array exported by Google Maps for iOS).
+ */
+function parseSemanticSegment(output: TimedLocation[], segment: JsonRecord) {
+  const startTime = segment.startTime
+  const endTime = segment.endTime
+  const start = parseTimestamp(startTime)
 
-  const points: TimedLocation[] = []
-  if (Array.isArray(value.locations)) {
-    for (const location of value.locations) {
-      if (!isRecord(location)) continue
-      addPoint(points, location, location.timestampMs ?? location.timestamp, accuracyOf(location))
-    }
-  }
-
-  if (Array.isArray(value.semanticSegments)) {
-    for (const segment of value.semanticSegments) {
-      if (!isRecord(segment)) continue
-      if (Array.isArray(segment.timelinePath)) {
-        for (const pathPoint of segment.timelinePath) {
-          if (!isRecord(pathPoint)) continue
-          addPoint(points, pathPoint, pathPoint.time ?? pathPoint.timestamp, accuracyOf(pathPoint))
-        }
+  if (Array.isArray(segment.timelinePath)) {
+    for (const pathPoint of segment.timelinePath) {
+      if (!isRecord(pathPoint)) continue
+      let timestamp: unknown = pathPoint.time ?? pathPoint.timestamp
+      const offset = Number(pathPoint.durationMinutesOffsetFromStartTime)
+      if (timestamp === undefined && start !== null && Number.isFinite(offset)) {
+        timestamp = start + offset * 60_000
       }
-      addPoint(points, segment.startLocation, segment.startTime)
-      addPoint(points, segment.endLocation, segment.endTime)
+      addPoint(output, pathPoint, timestamp, accuracyOf(pathPoint))
     }
   }
 
-  if (Array.isArray(value.timelineObjects)) {
-    for (const item of value.timelineObjects) parseTimelineObject(points, item)
+  const visit = isRecord(segment.visit) ? segment.visit : null
+  const visitPlace = visit && isRecord(visit.topCandidate) ? visit.topCandidate.placeLocation : null
+  if (visitPlace) {
+    addPoint(output, visitPlace, startTime)
+    addPoint(output, visitPlace, endTime)
+  }
+
+  const activity = isRecord(segment.activity) ? segment.activity : null
+  if (activity) {
+    addPoint(output, activity.start, startTime)
+    addPoint(output, activity.end, endTime)
+  }
+
+  addPoint(output, segment.startLocation, startTime)
+  addPoint(output, segment.endLocation, endTime)
+}
+
+export function parseTimelinePoints(value: unknown): TrackPoint[] {
+  const points: TimedLocation[] = []
+
+  if (Array.isArray(value)) {
+    for (const segment of value) {
+      if (isRecord(segment)) parseSemanticSegment(points, segment)
+    }
+  } else if (isRecord(value)) {
+    if (Array.isArray(value.locations)) {
+      for (const location of value.locations) {
+        if (!isRecord(location)) continue
+        addPoint(points, location, location.timestampMs ?? location.timestamp, accuracyOf(location))
+      }
+    }
+    if (Array.isArray(value.semanticSegments)) {
+      for (const segment of value.semanticSegments) {
+        if (isRecord(segment)) parseSemanticSegment(points, segment)
+      }
+    }
+    if (Array.isArray(value.rawSignals)) {
+      for (const signal of value.rawSignals) {
+        if (!isRecord(signal) || !isRecord(signal.position)) continue
+        const position = signal.position
+        addPoint(points, position, position.timestamp, accuracyOf(position))
+      }
+    }
+    if (Array.isArray(value.timelineObjects)) {
+      for (const item of value.timelineObjects) parseTimelineObject(points, item)
+    }
+  } else {
+    throw new Error('JSONの形式を確認してください')
   }
 
   if (!points.length) {
     throw new Error('GPS地点が見つかりません。Google MapsのタイムラインJSONを選択してください')
   }
+  return finalizePoints(points)
+}
 
+/** Removes duplicates, sorts by time and assigns ids. */
+export function finalizePoints(points: TimedLocation[]): TrackPoint[] {
   const uniquePoints = new Map<string, TimedLocation>()
   for (const point of points) {
     const key = `${point.recordedAt}|${point.latitude.toFixed(7)}|${point.longitude.toFixed(7)}`
     uniquePoints.set(key, point)
   }
-
   return [...uniquePoints.values()]
     .sort((left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt))
     .map((point) => ({ ...point, id: crypto.randomUUID() }))

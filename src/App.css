@@ -1803,6 +1803,16 @@
     accent-color: #397a69;
   }
 
+  .auth-notice {
+    padding: 10px 12px;
+    color: #2f6a5b;
+    border: 1px solid #cfe5dd;
+    border-radius: 8px;
+    background: #f1f8f5;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+
   .auth-error {
     padding: 10px 12px;
     color: #9c4038;

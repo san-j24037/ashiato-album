@@ -8,6 +8,14 @@ export interface AuthEnvironment {
   GAS_EXEC_URL?: string
   GAS_SERVICE_KEY?: string
   APP_SESSION_SECRET?: string
+  ADMIN_EMAILS?: string
+}
+
+/** ADMIN_EMAILS is a comma-separated list of administrator account email addresses. */
+export function isAdminEmail(env: AuthEnvironment, email: string): boolean {
+  if (!env.ADMIN_EMAILS) return false
+  const target = email.trim().toLowerCase()
+  return env.ADMIN_EMAILS.split(',').some((entry) => entry.trim().toLowerCase() === target && target.length > 0)
 }
 
 export type AuthServiceErrorCode =

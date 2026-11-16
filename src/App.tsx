@@ -38,8 +38,9 @@ import {
 import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
+import { AdminPage } from './AdminPage'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
-import { parseTimelinePoints } from './timeline-import'
+import { LOCATION_FILE_ACCEPT, parseLocationFile } from './location-import'
 import { emptyAppData, type AppData, type Memory, type PublicMemory, type TrackPoint } from './types'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
@@ -56,7 +57,7 @@ const intervals = [
 type Tab = 'map' | 'spots' | 'settings'
 type MapStyle = 'standard' | 'terrain' | 'satellite'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData; recommendations?: PublicMemory[] }
-type AccountProfile = { id: string; name: string; email: string }
+type AccountProfile = { id: string; name: string; email: string; isAdmin?: boolean }
 type PlaceSearchResult = {
   id: string
   latitude: number
@@ -471,7 +472,11 @@ function App() {
   const [accountSub, setAccountSub] = useState<string | null>(null)
   const [account, setAccount] = useState<AccountProfile | null>(null)
   const [authReady, setAuthReady] = useState(false)
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
+  const [authMode, setAuthMode] = useState<'login' | 'register' | 'reset'>('login')
+  const [resetStep, setResetStep] = useState<'request' | 'confirm'>('request')
+  const [adminOpen, setAdminOpen] = useState(false)
+  const [resetCode, setResetCode] = useState('')
+  const [authNotice, setAuthNotice] = useState('')
   const [authName, setAuthName] = useState('')
   const [authEmail, setAuthEmail] = useState('')
   const [authPassword, setAuthPassword] = useState('')
@@ -517,7 +522,7 @@ function App() {
   const webWatchId = useRef<number | null>(null)
   const intervalRef = useRef(intervalSeconds)
   const lastAcceptedTimeRef = useRef(0)
-  const syncDataRef = useRef<(sourceData?: AppData) => Promise<void>>(async () => {})
+  const syncDataRef = useRef<(sourceData?: AppData) => Promise<boolean>>(async () => false)
 
   useEffect(() => {
     let cancelled = false
@@ -683,13 +688,81 @@ function App() {
     setHasSynced(false)
     setAuthPassword('')
     setAuthPasswordConfirm('')
+    setResetCode('')
+    setAuthNotice('')
     setPrivacyAccepted(false)
     void syncDataRef.current(saved)
+  }
+
+  const switchAuthMode = (mode: 'login' | 'register' | 'reset') => {
+    setAuthError('')
+    setAuthNotice('')
+    setAuthPassword('')
+    setAuthPasswordConfirm('')
+    setResetCode('')
+    setResetStep('request')
+    setAuthMode(mode)
+  }
+
+  const requestPasswordReset = async () => {
+    setAuthBusy(true)
+    setAuthError('')
+    setAuthNotice('')
+    try {
+      const response = await fetch('/api/auth', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'requestPasswordReset', email: authEmail }),
+      })
+      const result = await response.json() as { ok: boolean; error?: string }
+      if (!response.ok || !result.ok) throw new Error(result.error ?? 'ワンタイムパスワードを送信できませんでした')
+      setResetStep('confirm')
+      setAuthNotice('登録済みのメールアドレスであれば、ワンタイムパスワードを送信しました。メールに記載された6桁の数字を入力してください（有効期限15分）。')
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'ワンタイムパスワードを送信できませんでした')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const submitPasswordReset = async () => {
+    if (resetStep === 'request') {
+      await requestPasswordReset()
+      return
+    }
+    if (authPassword !== authPasswordConfirm) {
+      setAuthError('確認用パスワードが一致しません')
+      return
+    }
+    setAuthBusy(true)
+    try {
+      const response = await fetch('/api/auth', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'resetPassword', email: authEmail, code: resetCode, password: authPassword }),
+      })
+      const result = await response.json() as { ok: boolean; user?: AccountProfile; error?: string }
+      if (!response.ok || !result.ok || !result.user) throw new Error(result.error ?? 'パスワードを変更できませんでした')
+      setAuthMode('login')
+      setResetStep('request')
+      await finishLogin(result.user)
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'パスワードを変更できませんでした')
+    } finally {
+      setAuthBusy(false)
+    }
   }
 
   const submitAuthentication = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setAuthError('')
+    if (authMode === 'reset') {
+      await submitPasswordReset()
+      return
+    }
+    setAuthNotice('')
     if (authMode === 'register') {
       if (authPassword !== authPasswordConfirm) {
         setAuthError('確認用パスワードが一致しません')
@@ -756,7 +829,11 @@ function App() {
       setSelectedRecommendation(null)
       setSelectedPoint(null)
       setTab('map')
+      setAdminOpen(false)
       setAuthMode('login')
+      setResetStep('request')
+      setResetCode('')
+      setAuthNotice('')
       setAuthPassword('')
       setAuthPasswordConfirm('')
       setAuthError('')
@@ -913,8 +990,10 @@ function App() {
       if (synchronizedData) setData(synchronizedData)
       setHasSynced(true)
       setMessage('アカウントに同期しました')
+      return true
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '同期に失敗しました')
+      return false
     } finally {
       setSyncing(false)
     }
@@ -1063,26 +1142,19 @@ function App() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    if (!file.name.toLowerCase().endsWith('.json')) {
-      setMessage('JSON形式のタイムラインファイルを選択してください')
+    if (!/\.(json|geojson|gpx|kml|csv)$/i.test(file.name)) {
+      setMessage('JSON・GeoJSON・GPX・KML・CSVのいずれかの位置情報ファイルを選択してください')
       return
     }
     if (file.size > 50 * 1024 * 1024) {
-      setMessage('ファイルは50MB以下のJSONを選択してください')
+      setMessage('ファイルは50MB以下のものを選択してください')
       return
     }
 
     setImportingTimeline(true)
     setMessage('')
     try {
-      let parsedJson: unknown
-      try {
-        parsedJson = JSON.parse(await file.text()) as unknown
-      } catch {
-        throw new Error('JSONファイルを読み取れません。ファイルの内容を確認してください')
-      }
-
-      const importedPoints = parseTimelinePoints(parsedJson)
+      const { points: importedPoints, format, skipped } = parseLocationFile(file.name, await file.text())
       const pointKey = (point: TrackPoint) => (
         `${point.recordedAt}|${point.latitude.toFixed(7)}|${point.longitude.toFixed(7)}`
       )
@@ -1093,16 +1165,23 @@ function App() {
         return
       }
 
-      setData((current) => ({
-        ...current,
-        points: [...current.points, ...newPoints].sort(
+      const nextData: AppData = {
+        ...data,
+        points: [...data.points, ...newPoints].sort(
           (left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt),
         ),
-      }))
+      }
+      setData(nextData)
       const latestImportedPoint = newPoints[newPoints.length - 1]
       setCenterRequest([latestImportedPoint.latitude, latestImportedPoint.longitude])
       setTab('map')
-      setMessage(`${newPoints.length.toLocaleString()}件のGPS地点を追加しました。端末に保存されています`)
+      const skippedNote = skipped ? `（日時のない${skipped.toLocaleString()}件は除外）` : ''
+      setMessage(`${format}から${newPoints.length.toLocaleString()}件のGPS地点を追加しました${skippedNote}。アカウントに同期しています…`)
+      // Reflect the imported points in the account spreadsheet right away.
+      const synced = await syncData(nextData)
+      setMessage(synced
+        ? `${format}から${newPoints.length.toLocaleString()}件のGPS地点を追加し、アカウントに同期しました${skippedNote}`
+        : `${newPoints.length.toLocaleString()}件のGPS地点を端末に追加しましたが、同期に失敗しました。通信状態を確認して「アカウントに同期」を押してください`)
     } catch (error) {
       console.error('タイムラインを読み込めませんでした。', error)
       setMessage(error instanceof Error ? error.message : 'タイムラインを読み込めませんでした')
@@ -1128,11 +1207,15 @@ function App() {
         <section className="auth-card">
           <div className="auth-brand"><Footprints size={25} /><span>ashiato</span></div>
           <div className="section-kicker">MY TRAVEL ALBUM</div>
-          <h1>{authMode === 'login' ? 'ログイン' : 'アカウントを作成'}</h1>
+          <h1>{authMode === 'login' ? 'ログイン' : authMode === 'register' ? 'アカウントを作成' : 'パスワードの再設定'}</h1>
           <p className="auth-description">
             {authMode === 'login'
               ? '旅の足跡とお気に入りスポットを開きます。'
-              : 'メールアドレスとパスワードで利用者登録します。'}
+              : authMode === 'register'
+                ? 'メールアドレスとパスワードで利用者登録します。'
+                : resetStep === 'request'
+                  ? '登録したメールアドレスにワンタイムパスワードを送信します。'
+                  : 'メールに届いたワンタイムパスワードと新しいパスワードを入力してください。'}
           </p>
           <form className="auth-form" onSubmit={submitAuthentication}>
             {authMode === 'register' && (
@@ -1158,9 +1241,28 @@ function App() {
               onChange={(event) => setAuthEmail(event.target.value)}
               autoComplete="email"
               maxLength={254}
+              readOnly={authMode === 'reset' && resetStep === 'confirm'}
               required
             />
-            <label className="field-label" htmlFor="auth-password">パスワード</label>
+            {authMode === 'reset' && resetStep === 'confirm' && (
+              <>
+                <label className="field-label" htmlFor="auth-reset-code">ワンタイムパスワード（6桁）</label>
+                <input
+                  id="auth-reset-code"
+                  className="text-field"
+                  value={resetCode}
+                  onChange={(event) => setResetCode(event.target.value.replace(/[^0-9]/g, '').slice(0, 6))}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  required
+                />
+              </>
+            )}
+            {(authMode !== 'reset' || resetStep === 'confirm') && (
+            <>
+            <label className="field-label" htmlFor="auth-password">{authMode === 'reset' ? '新しいパスワード' : 'パスワード'}</label>
             <div className="password-field">
               <input
                 id="auth-password"
@@ -1169,7 +1271,7 @@ function App() {
                 value={authPassword}
                 onChange={(event) => setAuthPassword(event.target.value)}
                 autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
-                minLength={authMode === 'register' ? 12 : 1}
+                minLength={authMode === 'login' ? 1 : 12}
                 maxLength={128}
                 required
               />
@@ -1182,9 +1284,11 @@ function App() {
                 {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
               </button>
             </div>
-            {authMode === 'register' && (
+            </>
+            )}
+            {(authMode === 'register' || (authMode === 'reset' && resetStep === 'confirm')) && (
               <>
-                <label className="field-label" htmlFor="auth-password-confirm">パスワード（確認）</label>
+                <label className="field-label" htmlFor="auth-password-confirm">{authMode === 'reset' ? '新しいパスワード（確認）' : 'パスワード（確認）'}</label>
                 <input
                   id="auth-password-confirm"
                   className="text-field"
@@ -1196,6 +1300,10 @@ function App() {
                   maxLength={128}
                   required
                 />
+              </>
+            )}
+            {authMode === 'register' && (
+              <>
                 <label className="auth-consent">
                   <input
                     type="checkbox"
@@ -1207,26 +1315,46 @@ function App() {
                 </label>
               </>
             )}
+            {authNotice && <p className="auth-notice" role="status">{authNotice}</p>}
             {authError && <p className="auth-error" role="alert">{authError}</p>}
             <button className="primary-button full-button auth-submit" type="submit" disabled={authBusy}>
-              {authBusy ? '処理中…' : authMode === 'login' ? 'ログイン' : '登録して開始'}
+              {authBusy
+                ? '処理中…'
+                : authMode === 'login'
+                  ? 'ログイン'
+                  : authMode === 'register'
+                    ? '登録して開始'
+                    : resetStep === 'request'
+                      ? 'ワンタイムパスワードを送信'
+                      : 'パスワードを変更してログイン'}
             </button>
           </form>
+          {authMode === 'reset' && resetStep === 'confirm' && (
+            <button className="auth-mode-toggle" type="button" disabled={authBusy} onClick={() => void requestPasswordReset()}>
+              メールが届かない場合は再送信
+            </button>
+          )}
+          {authMode === 'login' && (
+            <button className="auth-mode-toggle" type="button" disabled={authBusy} onClick={() => switchAuthMode('reset')}>
+              パスワードを忘れた方はこちら
+            </button>
+          )}
           <button
             className="auth-mode-toggle"
             type="button"
             disabled={authBusy}
-            onClick={() => {
-              setAuthError('')
-              setAuthMode((mode) => mode === 'login' ? 'register' : 'login')
-            }}
+            onClick={() => switchAuthMode(authMode === 'login' ? 'register' : 'login')}
           >
             {authMode === 'login' ? '初めて利用する方はこちら（新規登録）' : '登録済みの方はこちら（ログイン）'}
           </button>
-          <p className="auth-footnote">パスワードは暗号学的ハッシュとして保存されます。パスワード再設定機能はありません。</p>
+          <p className="auth-footnote">パスワードは暗号学的ハッシュとして保存されます。</p>
         </section>
       </main>
     )
+  }
+
+  if (adminOpen && account.isAdmin) {
+    return <AdminPage onClose={() => setAdminOpen(false)} />
   }
 
   return (
@@ -1269,29 +1397,34 @@ function App() {
             </div>
             <div className="privacy-note"><ShieldCheck size={17} /><span>足跡はこの端末に保存されます。地図表示では地図配信元に表示範囲が伝わります。</span></div>
             <div className="settings-divider" />
-            <div className="section-kicker">IMPORT TIMELINE</div>
-            <h2>タイムラインをインポート</h2>
-            <p className="muted-copy">Google MapsのタイムラインJSONからGPS地点を追加します。既存の地点は重複登録されません。</p>
+            <div className="section-kicker">IMPORT LOCATION FILE</div>
+            <h2>位置情報ファイルをインポート</h2>
+            <p className="muted-copy">GoogleマップのタイムラインJSON、GPX、KML、GeoJSON、CSV（緯度・経度・日時の列）からGPS地点を追加します。既存の地点は重複登録されません。</p>
             <input
               ref={timelineInputRef}
               className="visually-hidden"
               type="file"
-              accept=".json,application/json"
+              accept={LOCATION_FILE_ACCEPT}
               onChange={(event) => void importTimeline(event)}
-              aria-label="タイムラインJSONファイル"
+              aria-label="位置情報ファイル"
             />
             <button
               className="secondary-button full-button"
               onClick={() => timelineInputRef.current?.click()}
               disabled={importingTimeline}
             >
-              <FileUp size={17} />{importingTimeline ? '読み込み中…' : 'JSONファイルを選択'}
+              <FileUp size={17} />{importingTimeline ? '読み込み・同期中…' : 'ファイルを選択'}
             </button>
-            <p className="small-muted">読み込んだ地点は端末に保存されます。別端末で使うには、インポート後にアカウントへ同期してください。</p>
+            <p className="small-muted">読み込んだ地点は端末に保存され、続けてアカウント（スプレッドシート）へ自動で同期されます。</p>
             <div className="settings-divider" />
             <div className="section-kicker">ACCOUNT & SYNC</div>
             <h2>ログイン中のアカウント</h2>
             <p className="account-details"><strong>{account.name}</strong><span>{account.email}</span></p>
+            {account.isAdmin && (
+              <button className="secondary-button full-button" onClick={() => { setAdminOpen(true); setMobileMenuOpen(false) }}>
+                <ShieldCheck size={17} />管理者ページを開く
+              </button>
+            )}
             <button className="secondary-button full-button" onClick={() => void syncData()} disabled={syncing}>
               <Cloud size={17} />{syncing ? '同期中…' : 'アカウントに同期'}
             </button>

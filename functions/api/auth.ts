@@ -4,6 +4,7 @@ import {
   createSessionToken,
   hashPassword,
   AuthServiceError,
+  isAdminEmail,
   isRecord,
   isSameOriginRequest,
   normalizeEmail,
@@ -28,7 +29,7 @@ export const onRequestGet = async ({ request, env }: { request: Request; env: En
   if (!session) return Response.json({ ok: true, user: null }, { headers: privateHeaders })
   return Response.json({
     ok: true,
-    user: { id: session.id, name: session.name, email: session.email },
+    user: { id: session.id, name: session.name, email: session.email, isAdmin: isAdminEmail(env, session.email) },
   }, { headers: privateHeaders })
 }
 
@@ -57,6 +58,8 @@ export const onRequestPost = async ({ request, env }: { request: Request; env: E
   try {
     if (body.action === 'register') return await registerAccount(env, body)
     if (body.action === 'login') return await loginAccount(env, body)
+    if (body.action === 'requestPasswordReset') return await requestPasswordReset(env, body)
+    if (body.action === 'resetPassword') return await resetPassword(env, body)
     return errorResponse('操作を確認してください', 400)
   } catch (error) {
     console.error('Account authentication request failed', error)
@@ -133,10 +136,56 @@ async function loginAccount(env: Env, body: Record<string, unknown>): Promise<Re
   return authenticatedResponse(env, account)
 }
 
+async function requestPasswordReset(env: Env, body: Record<string, unknown>): Promise<Response> {
+  const email = normalizeEmail(body.email)
+  if (!email) return errorResponse('有効なメールアドレスを入力してください', 400)
+  const result = await callGas(env, { action: 'passwordResetRequest', email })
+  if (result.ok !== true && result.code === 'MAIL_QUOTA_EXCEEDED') {
+    return errorResponse('本日のメール送信数が無料枠の上限に近づいたため、再設定メールを送信できません。明日以降にもう一度お試しください', 429)
+  }
+  if (result.ok !== true) throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Password reset request failed')
+  // The response never reveals whether the address is registered.
+  return Response.json({ ok: true }, { headers: privateHeaders })
+}
+
+async function resetPassword(env: Env, body: Record<string, unknown>): Promise<Response> {
+  const email = normalizeEmail(body.email)
+  const code = typeof body.code === 'string' ? body.code.trim() : ''
+  const password = typeof body.password === 'string' ? body.password : ''
+  if (!email) return errorResponse('有効なメールアドレスを入力してください', 400)
+  if (!/^[0-9]{6}$/.test(code)) return errorResponse('ワンタイムパスワードは6桁の数字で入力してください', 400)
+  if (password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
+    return errorResponse(`パスワードは${PASSWORD_MIN_LENGTH}〜${PASSWORD_MAX_LENGTH}文字で設定してください`, 400)
+  }
+
+  const passwordHash = await hashPassword(password)
+  const result = await callGas(env, {
+    action: 'passwordResetConfirm',
+    email,
+    code,
+    passwordSalt: passwordHash.salt,
+    passwordHash: passwordHash.hash,
+  })
+  if (result.ok !== true) {
+    if (result.code === 'RESET_INVALID') {
+      return errorResponse('ワンタイムパスワードが正しくないか、有効期限が切れています。再度お試しいただくか、コードを再発行してください', 400)
+    }
+    throw new AuthServiceError('GAS_REQUEST_REJECTED', 'Password reset was rejected')
+  }
+  const storedUser = isRecord(result.user) ? result.user : null
+  const account: Account = {
+    id: storedUser && typeof storedUser.userId === 'string' ? storedUser.userId : '',
+    email,
+    name: storedUser && typeof storedUser.displayName === 'string' ? storedUser.displayName : '',
+  }
+  if (!account.id || !account.name) throw new Error('Stored account profile is incomplete')
+  return authenticatedResponse(env, account)
+}
+
 async function authenticatedResponse(env: Env, account: Account): Promise<Response> {
   const token = await createSessionToken(env, account)
   return Response.json(
-    { ok: true, user: account },
+    { ok: true, user: { ...account, isAdmin: isAdminEmail(env, account.email) } },
     { headers: { ...privateHeaders, 'Set-Cookie': sessionCookie(token) } },
   )
 }
