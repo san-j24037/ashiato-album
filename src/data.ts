@@ -88,9 +88,12 @@ function normalizeData(data: AppData): AppData {
       isPublic: memory.isPublic ?? false,
       listId: memory.listId ?? '',
       mark: memory.mark ?? null,
+      visibility: memory.visibility ?? (memory.isPublic ? 'public' : 'private'),
     })),
     // Data saved before favorite lists existed has no `lists`.
-    lists: Array.isArray(data.lists) ? data.lists : [],
+    lists: Array.isArray(data.lists)
+      ? data.lists.map((list) => ({ ...list, visibility: list.visibility ?? 'private' }))
+      : [],
   }
 }
 

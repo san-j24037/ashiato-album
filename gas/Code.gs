@@ -12,10 +12,15 @@ const MEMORY_HEADERS = [
   'isPublic',
   'ownerName',
   'listId',
-  'mark'
+  'mark',
+  'visibility'
 ];
 const LEGACY_SPOT_HEADERS = MEMORY_HEADERS.slice(0, 8);
-const LIST_HEADERS = ['userSub', 'id', 'name', 'mark', 'createdAt', 'updatedAt', 'deletedAt'];
+const LIST_HEADERS = ['userSub', 'id', 'name', 'mark', 'createdAt', 'updatedAt', 'deletedAt', 'visibility'];
+const FOLLOW_HEADERS = ['followerId', 'followeeId', 'createdAt'];
+const VISIBILITIES = ['private', 'followers', 'public'];
+const SOCIAL_FEED_LIMIT = 60;
+const SOCIAL_SEARCH_LIMIT = 20;
 const USER_HEADERS = [
   'userId',
   'email',
@@ -29,7 +34,8 @@ const USER_HEADERS = [
   'resetCodeHash',
   'resetExpiresAt',
   'resetAttempts',
-  'resetRequestedAt'
+  'resetRequestedAt',
+  'nickname'
 ];
 const MAX_LOGIN_FAILURES = 5;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
@@ -86,6 +92,16 @@ function doPost(event) {
       return jsonResponse(adminUserDetail(usersSheet, pointsSheet, memoriesSheet, body.userId));
     }
 
+    if (String(body.action || '').indexOf('social') === 0) {
+      const social = {
+        users: usersSheet,
+        memories: memoriesSheet,
+        lists: getOrCreateSheet(spreadsheet, 'Lists', LIST_HEADERS),
+        follows: getOrCreateSheet(spreadsheet, 'Follows', FOLLOW_HEADERS)
+      };
+      return jsonResponse(handleSocial(user.sub, social, body));
+    }
+
     if (body.action !== 'sync') {
       throw new Error('Unsupported action');
     }
@@ -109,6 +125,7 @@ function doPost(event) {
     }
 
     const listsSheet = getOrCreateSheet(spreadsheet, 'Lists', LIST_HEADERS);
+    const followsSheet = getOrCreateSheet(spreadsheet, 'Follows', FOLLOW_HEADERS);
     mergePoints(user.sub, pointsSheet, points);
     mergeMemories(user.sub, memoriesSheet, memories, user.name);
     mergeLists(user.sub, listsSheet, lists);
@@ -117,7 +134,12 @@ function doPost(event) {
     return jsonResponse({
       ok: true,
       data: userData,
-      recommendations: readPublicMemories(user.sub, memoriesSheet)
+      recommendations: readVisibleOthersFavorites(user.sub, {
+        users: usersSheet,
+        memories: memoriesSheet,
+        lists: listsSheet,
+        follows: followsSheet
+      })
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unexpected server error';
@@ -243,7 +265,8 @@ function registerAccount(sheet, body) {
     '',
     0,
     0,
-    0
+    0,
+    ''
   ]]);
   return { ok: true };
 }
@@ -506,6 +529,7 @@ function mergeMemories(userSub, sheet, memories, ownerName) {
   });
 
   memories.forEach(memory => {
+    const visibility = memoryVisibilityOf(memory);
     const row = [
       userSub,
       memory.id,
@@ -516,10 +540,11 @@ function mergeMemories(userSub, sheet, memories, ownerName) {
       memory.createdAt,
       JSON.stringify(Array.isArray(memory.driveFiles) ? memory.driveFiles : []),
       memory.address || '',
-      memory.isPublic === true,
+      visibility === 'public',
       ownerName,
       memory.listId || '',
-      memory.mark ? JSON.stringify({ symbol: memory.mark.symbol, color: memory.mark.color }) : ''
+      memory.mark ? JSON.stringify({ symbol: memory.mark.symbol, color: memory.mark.color }) : '',
+      visibility
     ];
     const existingRow = rowById.get(memory.id);
     if (existingRow) {
@@ -554,9 +579,27 @@ function readUserData(userSub, pointsSheet, memoriesSheet) {
       address: String(row[8] || ''),
       isPublic: row[9] === true,
       listId: String(row[11] || ''),
-      mark: parseMark(row[12])
+      mark: parseMark(row[12]),
+      visibility: rowVisibility(row)
     }));
   return { points: points, memories: memories };
+}
+
+/** Visibility sent by the app; older app versions only send isPublic. */
+function memoryVisibilityOf(memory) {
+  if (VISIBILITIES.indexOf(memory.visibility) >= 0) return memory.visibility;
+  return memory.isPublic === true ? 'public' : 'private';
+}
+
+/** Visibility stored in a Favorites row (older rows only have the isPublic column). */
+function rowVisibility(row) {
+  const stored = String(row[13] || '');
+  if (VISIBILITIES.indexOf(stored) >= 0) return stored;
+  return row[9] === true ? 'public' : 'private';
+}
+
+function isValidVisibility(value) {
+  return value === undefined || VISIBILITIES.indexOf(value) >= 0;
 }
 
 /** Lists are stored per user; a row is replaced only by a newer version (updatedAt). */
@@ -576,7 +619,8 @@ function mergeLists(userSub, sheet, lists) {
       JSON.stringify({ symbol: list.mark.symbol, color: list.mark.color }),
       list.createdAt,
       list.updatedAt,
-      list.deletedAt || ''
+      list.deletedAt || '',
+      VISIBILITIES.indexOf(list.visibility) >= 0 ? list.visibility : 'private'
     ];
     const existing = rowById.get(list.id);
     if (!existing) {
@@ -598,7 +642,8 @@ function readUserLists(userSub, sheet) {
         name: String(row[2]),
         mark: parseMark(row[3]) || { symbol: '♥', color: '#d78072' },
         createdAt: toIsoString(row[4]),
-        updatedAt: toIsoString(row[5])
+        updatedAt: toIsoString(row[5]),
+        visibility: VISIBILITIES.indexOf(String(row[7])) >= 0 ? String(row[7]) : 'private'
       };
       if (row[6]) list.deletedAt = toIsoString(row[6]);
       return list;
@@ -627,24 +672,241 @@ function isValidList(list) {
     isValidMark(list.mark) &&
     typeof list.createdAt === 'string' && !isNaN(Date.parse(list.createdAt)) &&
     typeof list.updatedAt === 'string' && !isNaN(Date.parse(list.updatedAt)) &&
-    (list.deletedAt === undefined || (typeof list.deletedAt === 'string' && !isNaN(Date.parse(list.deletedAt))));
+    (list.deletedAt === undefined || (typeof list.deletedAt === 'string' && !isNaN(Date.parse(list.deletedAt)))) &&
+    isValidVisibility(list.visibility);
 }
 
-function readPublicMemories(userSub, sheet) {
-  return readSheet(sheet).slice(1)
-    .filter(row => String(row[0]) !== userSub && row[9] === true)
-    .map(row => ({
+// ---------------------------------------------------------------------------
+// SNS: nicknames, follows and visibility-checked sharing of favorites / lists.
+// Every visibility decision is made here, so data a viewer may not see is never returned.
+// ---------------------------------------------------------------------------
+
+/** Nicknames are compared case- and width-insensitively. */
+function normalizeNickname(value) {
+  return String(value || '').normalize('NFKC').trim().toLowerCase();
+}
+
+function isValidNickname(value) {
+  return typeof value === 'string' && /^[\p{L}\p{N}_]{2,20}$/u.test(value.normalize('NFKC').trim());
+}
+
+function visibilityRank(visibility) {
+  return visibility === 'public' ? 2 : visibility === 'followers' ? 1 : 0;
+}
+
+function canView(visibility, viewerFollowsOwner) {
+  return visibility === 'public' || (visibility === 'followers' && viewerFollowsOwner);
+}
+
+function loadSocialContext(social) {
+  const users = readSheet(social.users).slice(1).filter(row => String(row[0]));
+  const nicknameById = new Map();
+  const idByNickname = new Map();
+  users.forEach(row => {
+    const nickname = String(row[13] || '').trim();
+    if (!nickname) return;
+    nicknameById.set(String(row[0]), nickname);
+    idByNickname.set(normalizeNickname(nickname), String(row[0]));
+  });
+  const follows = readSheet(social.follows).slice(1).map((row, index) => ({
+    row: index + 2,
+    follower: String(row[0]),
+    followee: String(row[1])
+  }));
+  const listsByKey = new Map();
+  readSheet(social.lists).slice(1).forEach(row => {
+    if (row[6]) return; // deleted
+    listsByKey.set(String(row[0]) + ':' + String(row[1]), {
       id: String(row[1]),
-      title: String(row[2]),
-      note: String(row[3]),
-      latitude: Number(row[4]),
-      longitude: Number(row[5]),
-      createdAt: toIsoString(row[6]),
-      driveFiles: [],
-      address: String(row[8] || ''),
-      isPublic: true,
-      ownerName: String(row[10] || 'ユーザー')
-    }));
+      owner: String(row[0]),
+      name: String(row[2]),
+      mark: parseMark(row[3]) || { symbol: '♥', color: '#d78072' },
+      visibility: VISIBILITIES.indexOf(String(row[7])) >= 0 ? String(row[7]) : 'private',
+      createdAt: toIsoString(row[4])
+    });
+  });
+  return { users: users, nicknameById: nicknameById, idByNickname: idByNickname, follows: follows, listsByKey: listsByKey };
+}
+
+function followingOf(ctx, userId) {
+  return new Set(ctx.follows.filter(follow => follow.follower === userId).map(follow => follow.followee));
+}
+
+function followerCount(ctx, userId) {
+  return ctx.follows.filter(follow => follow.followee === userId).length;
+}
+
+function followingCount(ctx, userId) {
+  return ctx.follows.filter(follow => follow.follower === userId).length;
+}
+
+/**
+ * A favorite as another user may see it, or null when they may not.
+ * Its effective visibility is the wider of its own setting and its list's setting.
+ */
+function favoriteForViewer(row, ctx, viewer, viewerFollowing, isOwnerView) {
+  const owner = String(row[0]);
+  const list = row[11] ? ctx.listsByKey.get(owner + ':' + String(row[11])) : null;
+  const own = rowVisibility(row);
+  const visibility = list && visibilityRank(list.visibility) > visibilityRank(own) ? list.visibility : own;
+  const follows = viewerFollowing.has(owner);
+  if (!isOwnerView && (owner === viewer || !canView(visibility, follows))) return null;
+  const listVisible = list && (isOwnerView || canView(list.visibility, follows));
+  const nickname = ctx.nicknameById.get(owner) || '';
+  return {
+    id: String(row[1]),
+    title: String(row[2]),
+    note: String(row[3]),
+    latitude: Number(row[4]),
+    longitude: Number(row[5]),
+    createdAt: toIsoString(row[6]),
+    driveFiles: [],
+    address: String(row[8] || ''),
+    isPublic: visibility === 'public',
+    visibility: visibility,
+    listId: listVisible ? list.id : '',
+    listName: listVisible ? list.name : '',
+    mark: parseMark(row[12]) || (list ? list.mark : null),
+    ownerNickname: nickname,
+    // Accounts without a nickname keep the old behaviour of showing their display name on public spots.
+    ownerName: nickname || (visibility === 'public' ? String(row[10] || 'ユーザー') : 'ユーザー')
+  };
+}
+
+/** Favorites of other users that the viewer may see (shown as recommendations on the map). */
+function readVisibleOthersFavorites(viewer, social) {
+  const ctx = loadSocialContext(social);
+  const viewerFollowing = followingOf(ctx, viewer);
+  return readSheet(social.memories).slice(1)
+    .map(row => favoriteForViewer(row, ctx, viewer, viewerFollowing, false))
+    .filter(favorite => favorite);
+}
+
+function socialError(code, error) {
+  return { ok: false, code: code, error: error };
+}
+
+function handleSocial(viewer, social, body) {
+  const ctx = loadSocialContext(social);
+  const myNickname = ctx.nicknameById.get(viewer) || '';
+  const viewerFollowing = followingOf(ctx, viewer);
+  const targetIdOf = nickname => ctx.idByNickname.get(normalizeNickname(nickname)) || null;
+  const summary = userId => ({
+    nickname: ctx.nicknameById.get(userId) || '',
+    followerCount: followerCount(ctx, userId),
+    followingCount: followingCount(ctx, userId),
+    isFollowing: viewerFollowing.has(userId),
+    followsMe: ctx.follows.some(follow => follow.follower === userId && follow.followee === viewer),
+    isMe: userId === viewer
+  });
+
+  switch (body.action) {
+    case 'socialMe':
+      return { ok: true, me: summary(viewer) };
+
+    case 'socialSetNickname': {
+      const nickname = typeof body.nickname === 'string' ? body.nickname.normalize('NFKC').trim() : '';
+      if (!isValidNickname(nickname)) {
+        return socialError('NICKNAME_INVALID', 'ニックネームは2〜20文字の文字・数字・アンダースコア（_）で入力してください');
+      }
+      const owner = ctx.idByNickname.get(normalizeNickname(nickname));
+      if (owner && owner !== viewer) {
+        return socialError('NICKNAME_TAKEN', 'このニックネームはすでに使われています');
+      }
+      const index = ctx.users.findIndex(row => String(row[0]) === viewer);
+      if (index < 0) return socialError('USER_NOT_FOUND', 'アカウントが見つかりません');
+      social.users.getRange(index + 2, 14).setValue(nickname);
+      ctx.nicknameById.set(viewer, nickname);
+      return { ok: true, me: summary(viewer) };
+    }
+
+    case 'socialSearch': {
+      const query = normalizeNickname(body.query);
+      if (!query) return { ok: true, users: [] };
+      const users = [];
+      ctx.nicknameById.forEach((nickname, userId) => {
+        if (userId !== viewer && normalizeNickname(nickname).indexOf(query) >= 0) users.push(summary(userId));
+      });
+      users.sort((a, b) => b.followerCount - a.followerCount);
+      return { ok: true, users: users.slice(0, SOCIAL_SEARCH_LIMIT) };
+    }
+
+    case 'socialFollow': {
+      if (!myNickname) {
+        return socialError('NICKNAME_REQUIRED', 'フォローするには、先に自分のニックネームを設定してください');
+      }
+      const target = targetIdOf(body.nickname);
+      if (!target) return socialError('USER_NOT_FOUND', 'ユーザーが見つかりません（ニックネームを設定しているユーザーだけフォローできます）');
+      if (target === viewer) return socialError('SELF_FOLLOW', '自分自身はフォローできません');
+      if (!viewerFollowing.has(target)) appendRows(social.follows, [[viewer, target, new Date().toISOString()]]);
+      viewerFollowing.add(target);
+      ctx.follows.push({ row: -1, follower: viewer, followee: target });
+      return { ok: true, user: summary(target) };
+    }
+
+    case 'socialUnfollow':
+    case 'socialRemoveFollower': {
+      const target = targetIdOf(body.nickname);
+      if (!target) return socialError('USER_NOT_FOUND', 'ユーザーが見つかりません');
+      const follower = body.action === 'socialUnfollow' ? viewer : target;
+      const followee = body.action === 'socialUnfollow' ? target : viewer;
+      ctx.follows
+        .filter(follow => follow.follower === follower && follow.followee === followee && follow.row > 0)
+        .map(follow => follow.row)
+        .sort((a, b) => b - a)
+        .forEach(row => social.follows.deleteRow(row));
+      ctx.follows = ctx.follows.filter(follow => !(follow.follower === follower && follow.followee === followee));
+      if (body.action === 'socialUnfollow') viewerFollowing.delete(target);
+      return { ok: true, user: summary(target) };
+    }
+
+    case 'socialConnections': {
+      const kind = body.kind === 'followers' ? 'followers' : 'following';
+      const ids = ctx.follows
+        .filter(follow => (kind === 'following' ? follow.follower === viewer : follow.followee === viewer))
+        .map(follow => (kind === 'following' ? follow.followee : follow.follower));
+      return { ok: true, users: ids.filter(id => ctx.nicknameById.has(id)).map(summary) };
+    }
+
+    case 'socialProfile': {
+      const target = targetIdOf(body.nickname);
+      if (!target) return socialError('USER_NOT_FOUND', 'ユーザーが見つかりません');
+      const isMe = target === viewer;
+      const follows = viewerFollowing.has(target);
+      const favorites = readSheet(social.memories).slice(1)
+        .filter(row => String(row[0]) === target)
+        .map(row => favoriteForViewer(row, ctx, viewer, viewerFollowing, isMe))
+        .filter(favorite => favorite && (!isMe || favorite.visibility !== 'private'))
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+      const lists = [];
+      ctx.listsByKey.forEach(list => {
+        if (list.owner !== target) return;
+        if (isMe ? list.visibility === 'private' : !canView(list.visibility, follows)) return;
+        lists.push({
+          id: list.id,
+          name: list.name,
+          mark: list.mark,
+          visibility: list.visibility,
+          count: favorites.filter(favorite => favorite.listId === list.id).length
+        });
+      });
+      lists.sort((a, b) => a.name.localeCompare(b.name));
+      return { ok: true, profile: summary(target), lists: lists, favorites: favorites };
+    }
+
+    case 'socialFeed': {
+      const favorites = readSheet(social.memories).slice(1)
+        .filter(row => viewerFollowing.has(String(row[0])))
+        .map(row => favoriteForViewer(row, ctx, viewer, viewerFollowing, false))
+        .filter(favorite => favorite)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+        .slice(0, SOCIAL_FEED_LIMIT);
+      return { ok: true, favorites: favorites };
+    }
+
+    default:
+      throw new Error('Unsupported action');
+  }
 }
 
 function adminUserSummary(row) {
@@ -767,7 +1029,8 @@ function isValidMemory(memory) {
     Array.isArray(memory.driveFiles) && memory.driveFiles.length <= 100 &&
     memory.driveFiles.every(isValidDriveFile) &&
     (memory.listId === undefined || (typeof memory.listId === 'string' && memory.listId.length <= 120)) &&
-    (memory.mark === undefined || memory.mark === null || isValidMark(memory.mark));
+    (memory.mark === undefined || memory.mark === null || isValidMark(memory.mark)) &&
+    isValidVisibility(memory.visibility);
 }
 
 function isValidDriveFile(file) {

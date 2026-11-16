@@ -32,6 +32,7 @@ import {
   ShieldCheck,
   Sparkles,
   Upload,
+  Users,
   Video,
   X,
 } from 'lucide-react'
@@ -42,9 +43,10 @@ import { AdminPage } from './AdminPage'
 import { loadAccountData, saveAppData, setActiveAccount } from './data'
 import { LOCATION_FILE_ACCEPT, parseLocationFile } from './location-import'
 import { LocationImportError } from './timeline-import'
-import { emptyAppData, type AppData, type FavoriteList, type Mark, type Memory, type PublicMemory, type TrackPoint } from './types'
-import { DEFAULT_MARK, effectiveMark, escapeHtml } from './marks'
-import { ListEditorDialog, MarkBadge, MarkPicker } from './FavoriteLists'
+import { emptyAppData, type AppData, type FavoriteList, type Mark, type Memory, type PublicMemory, type TrackPoint, type Visibility } from './types'
+import { DEFAULT_MARK, VISIBILITY_LABELS, effectiveMark, escapeHtml, sanitizeMark } from './marks'
+import { ListEditorDialog, MarkBadge, MarkPicker, VisibilitySelect } from './FavoriteLists'
+import { SocialPanel } from './SocialPanel'
 
 const BackgroundGeolocation = registerPlugin<BackgroundGeolocationPlugin>('BackgroundGeolocation')
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined
@@ -57,7 +59,7 @@ const intervals = [
   { seconds: 60, label: '1分ごと', detail: '記録を控えめに' },
 ]
 
-type Tab = 'map' | 'spots' | 'settings'
+type Tab = 'map' | 'spots' | 'social' | 'settings'
 type MapStyle = 'standard' | 'terrain' | 'satellite'
 type SyncResponse = { ok: boolean; error?: string; data?: AppData; recommendations?: PublicMemory[] }
 type ImportResult = {
@@ -477,15 +479,24 @@ function MapView({
     const recommendationLayer = recommendationLayerRef.current
     if (!recommendationLayer) return
     recommendationLayer.clearLayers()
-    const icon = L.divIcon({
+    const defaultIcon = L.divIcon({
       className: 'recommendation-marker',
-      html: '<span>★</span>',
+      html: '<span><i>★</i></span>',
       iconSize: [36, 42],
       iconAnchor: [18, 38],
     })
     for (const memory of recommendations) {
+      const mark = sanitizeMark(memory.mark)
+      const icon = mark
+        ? L.divIcon({
+            className: 'recommendation-marker',
+            html: `<span style="background:${mark.color}"><i>${escapeHtml(mark.symbol)}</i></span>`,
+            iconSize: [36, 42],
+            iconAnchor: [18, 38],
+          })
+        : defaultIcon
       L.marker([memory.latitude, memory.longitude], { icon })
-        .bindTooltip(memory.title)
+        .bindTooltip(`${memory.title}（${memory.ownerNickname ? `@${memory.ownerNickname}` : memory.ownerName}）`)
         .on('click', () => onSelectRecommendation(memory))
         .addTo(recommendationLayer)
     }
@@ -639,7 +650,7 @@ function App() {
   const [editSpotTitle, setEditSpotTitle] = useState('')
   const [editSpotAddress, setEditSpotAddress] = useState('')
   const [editSpotNote, setEditSpotNote] = useState('')
-  const [editSpotIsPublic, setEditSpotIsPublic] = useState(false)
+  const [editSpotVisibility, setEditSpotVisibility] = useState<Visibility>('private')
   const [editSpotListId, setEditSpotListId] = useState('')
   const [editSpotMark, setEditSpotMark] = useState<Mark | null>(null)
   // 'all' | 'none' (favorites without a list) | a list id
@@ -651,7 +662,10 @@ function App() {
   const [spotTitle, setSpotTitle] = useState('')
   const [spotAddress, setSpotAddress] = useState('')
   const [spotNote, setSpotNote] = useState('')
-  const [spotIsPublic, setSpotIsPublic] = useState(false)
+  const [spotVisibility, setSpotVisibility] = useState<Visibility>('private')
+  // Shared favorites the みんな tab wants on the map (null = normal recommendations).
+  const [socialMapFavorites, setSocialMapFavorites] = useState<PublicMemory[] | null>(null)
+  const [socialProfileRequest, setSocialProfileRequest] = useState<{ nickname: string; key: number } | null>(null)
   const [spotListId, setSpotListId] = useState('')
   const [spotMark, setSpotMark] = useState<Mark | null>(null)
   const [nativeWatcherId, setNativeWatcherId] = useState<string | null>(null)
@@ -810,7 +824,7 @@ function App() {
     setSpotTitle('')
     setSpotAddress('')
     setSpotNote('')
-    setSpotIsPublic(false)
+    setSpotVisibility('private')
     // New favorites go into the list currently shown in the favorites tab.
     const filter = listFilterRef.current
     setSpotListId(filter !== 'all' && filter !== 'none' ? filter : '')
@@ -827,7 +841,7 @@ function App() {
     setEditSpotTitle(memory.title)
     setEditSpotAddress(memory.address ?? '')
     setEditSpotNote(memory.note)
-    setEditSpotIsPublic(memory.isPublic ?? false)
+    setEditSpotVisibility(memory.visibility ?? (memory.isPublic ? 'public' : 'private'))
     setEditSpotListId(memory.listId ?? '')
     setEditSpotMark(memory.mark ?? null)
   }, [])
@@ -1011,7 +1025,8 @@ function App() {
       title: spotTitle.trim(),
       address: spotAddress.trim(),
       note: spotNote.trim(),
-      isPublic: spotIsPublic,
+      isPublic: spotVisibility === 'public',
+      visibility: spotVisibility,
       listId: spotListId,
       mark: spotMark,
       latitude: selectedPoint.latitude,
@@ -1034,7 +1049,8 @@ function App() {
       title: editSpotTitle.trim(),
       address: editSpotAddress.trim(),
       note: editSpotNote.trim(),
-      isPublic: editSpotIsPublic,
+      isPublic: editSpotVisibility === 'public',
+      visibility: editSpotVisibility,
       listId: editSpotListId,
       mark: editSpotMark,
     }
@@ -1048,12 +1064,27 @@ function App() {
     void syncData(nextData)
   }
 
-  const saveList = (name: string, mark: Mark) => {
+  const openSharedFavorite = useCallback((favorite: PublicMemory) => {
+    setSelectedMemory(null)
+    setSelectedRecommendation(favorite)
+    setCenterRequest([favorite.latitude, favorite.longitude])
+    setMobileMenuOpen(false)
+  }, [])
+
+  const openSocialProfile = (nickname: string) => {
+    if (!nickname) return
+    setSelectedRecommendation(null)
+    setSocialProfileRequest((current) => ({ nickname, key: (current?.key ?? 0) + 1 }))
+    setTab('social')
+    setMobileMenuOpen(true)
+  }
+
+  const saveList = (name: string, mark: Mark, visibility: Visibility) => {
     const now = new Date().toISOString()
     const editing = listEditor?.list
     const saved: FavoriteList = editing
-      ? { ...editing, name, mark, updatedAt: now }
-      : { id: crypto.randomUUID(), name, mark, createdAt: now, updatedAt: now }
+      ? { ...editing, name, mark, visibility, updatedAt: now }
+      : { id: crypto.randomUUID(), name, mark, visibility, createdAt: now, updatedAt: now }
     const nextData: AppData = {
       ...data,
       lists: editing ? data.lists.map((list) => list.id === saved.id ? saved : list) : [...data.lists, saved],
@@ -1644,12 +1675,22 @@ function App() {
           <button className={`nav-item ${tab === 'spots' ? 'selected' : ''}`} onClick={() => { setTab('spots'); setMobileMenuOpen(false) }}>
             <Heart size={19} /><span>お気に入りスポット</span><span className="nav-count">{data.memories.length}</span>
           </button>
+          <button className={`nav-item ${tab === 'social' ? 'selected' : ''}`} onClick={() => { setTab('social'); setMobileMenuOpen(false) }}>
+            <Users size={19} /><span>みんな</span>
+          </button>
           <button className={`nav-item ${tab === 'settings' ? 'selected' : ''}`} onClick={() => { setTab('settings'); setMobileMenuOpen(false) }}>
             <Settings2 size={19} /><span>記録の設定</span>
           </button>
         </nav>
 
-        {tab === 'settings' ? (
+        {tab === 'social' ? (
+          <SocialPanel
+            key={socialProfileRequest?.key ?? 0}
+            initialProfile={socialProfileRequest?.nickname}
+            onShowFavorites={setSocialMapFavorites}
+            onSelectFavorite={openSharedFavorite}
+          />
+        ) : tab === 'settings' ? (
           <section className="settings-panel">
             <div className="section-kicker">GPS RECORDING</div>
             <h2>記録の間隔</h2>
@@ -1769,7 +1810,7 @@ function App() {
                 {selectedList && (
                   <div className="list-header">
                     <MarkBadge mark={selectedList.mark} size={30} />
-                    <span><strong>{selectedList.name}</strong><small>{listCounts.get(selectedList.id) ?? 0}件のお気に入り</small></span>
+                    <span><strong>{selectedList.name}</strong><small>{listCounts.get(selectedList.id) ?? 0}件のお気に入り・{VISIBILITY_LABELS[selectedList.visibility ?? 'private']}</small></span>
                     <button type="button" className="secondary-button" onClick={() => setListEditor({ list: selectedList })}>編集</button>
                   </div>
                 )}
@@ -1779,7 +1820,7 @@ function App() {
                   return (
                   <button className="memory-card" key={memory.id} onClick={() => onSelectMemory(memory)}>
                     <MarkBadge mark={mark} size={34} />
-                    <span className="memory-card-text"><strong>{memory.title}</strong>{list && listFilter === 'all' && <small className="memory-card-list">{list.name}</small>}<small>{memory.address || memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{memory.isPublic ? 'おすすめとして公開中' : memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
+                    <span className="memory-card-text"><strong>{memory.title}</strong>{list && listFilter === 'all' && <small className="memory-card-list">{list.name}</small>}<small>{memory.address || memory.note || `${memory.latitude.toFixed(4)}, ${memory.longitude.toFixed(4)}`}</small><small>{(memory.visibility ?? 'private') !== 'private' ? VISIBILITY_LABELS[memory.visibility ?? 'private'] : memory.driveFiles.length ? `写真・動画 ${memory.driveFiles.length}件` : '思い出を追加できます'}</small></span>
                     <ChevronDown size={16} className="memory-chevron" />
                   </button>
                   )
@@ -1803,7 +1844,7 @@ function App() {
       <section className="map-section">
         <header className="topbar">
           <button className="icon-button mobile-menu-button" onClick={() => setMobileMenuOpen(true)} aria-label="メニュー"><Menu size={20} /></button>
-          <div className="breadcrumb"><span>マイアルバム</span><span className="breadcrumb-divider">/</span><strong>{tab === 'map' ? '足跡マップ' : tab === 'spots' ? 'お気に入り' : '記録の設定'}</strong></div>
+          <div className="breadcrumb"><span>マイアルバム</span><span className="breadcrumb-divider">/</span><strong>{tab === 'map' ? '足跡マップ' : tab === 'spots' ? 'お気に入り' : tab === 'social' ? 'みんな' : '記録の設定'}</strong></div>
           <div className="topbar-actions">
             <span className="location-label"><span className="location-pulse" />{active ? '位置情報を使用中' : 'GPS待機中'}</span>
             <button className="avatar-button" onClick={() => setTab('settings')} aria-label="アカウント設定">{account.name.slice(0, 1)}</button>
@@ -1813,7 +1854,7 @@ function App() {
           points={data.points}
           memories={mapMemories}
           lists={data.lists}
-          recommendations={recommendations}
+          recommendations={tab === 'social' && socialMapFavorites ? socialMapFavorites : recommendations}
           active={active}
           onSelect={onSelectMemory}
           onSelectRecommendation={onSelectRecommendation}
@@ -1859,10 +1900,8 @@ function App() {
               <label className="field-label">説明
                 <textarea className="text-field note-field" value={editSpotNote} maxLength={2000} onChange={(event) => setEditSpotNote(event.target.value)} rows={3} />
               </label>
-              <label className="visibility-option">
-                <input type="checkbox" checked={editSpotIsPublic} onChange={(event) => setEditSpotIsPublic(event.target.checked)} />
-                <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
-              </label>
+              <span className="field-label" id="edit-spot-visibility">公開範囲</span>
+              <VisibilitySelect id="edit-spot-visibility" value={editSpotVisibility} onChange={setEditSpotVisibility} />
               <label className="field-label">リスト
                 <select className="text-field" value={editSpotListId} onChange={(event) => setEditSpotListId(event.target.value)}>
                   <option value="">未分類</option>
@@ -1898,7 +1937,15 @@ function App() {
             {selectedRecommendation.address && <p>{selectedRecommendation.address}</p>}
             {selectedRecommendation.note && <p>{selectedRecommendation.note}</p>}
             <div className="detail-coordinate">{selectedRecommendation.latitude.toFixed(5)}°, {selectedRecommendation.longitude.toFixed(5)}°</div>
-            <p className="recommendation-owner">おすすめした人：{selectedRecommendation.ownerName}</p>
+            {selectedRecommendation.listName && <p className="recommendation-owner">リスト：{selectedRecommendation.listName}</p>}
+            <p className="recommendation-owner">
+              {selectedRecommendation.ownerNickname ? `@${selectedRecommendation.ownerNickname}` : selectedRecommendation.ownerName} さんのお気に入り
+            </p>
+            {selectedRecommendation.ownerNickname && (
+              <button type="button" className="secondary-button full-button" onClick={() => openSocialProfile(selectedRecommendation.ownerNickname ?? '')}>
+                <Users size={16} />プロフィールを見る
+              </button>
+            )}
           </div>
         )}
         {selectedSearchResult && (
@@ -2006,10 +2053,8 @@ function App() {
             <input id="spot-address" className="text-field" value={spotAddress} maxLength={300} onChange={(event) => setSpotAddress(event.target.value)} placeholder="住所を入力" />
             <label className="field-label" htmlFor="spot-note">説明 <span>任意</span></label>
             <textarea id="spot-note" className="text-field note-field" value={spotNote} maxLength={2000} onChange={(event) => setSpotNote(event.target.value)} placeholder="場所のおすすめポイントや思い出" rows={3} />
-            <label className="visibility-option">
-                <input type="checkbox" checked={spotIsPublic} onChange={(event) => setSpotIsPublic(event.target.checked)} />
-              <span><strong>おすすめスポットとして公開</strong><small>公開すると、他のユーザーの地図に表示されます</small></span>
-            </label>
+            <span className="field-label" id="spot-visibility">公開範囲</span>
+            <VisibilitySelect id="spot-visibility" value={spotVisibility} onChange={setSpotVisibility} />
             <label className="field-label" htmlFor="spot-list">リスト</label>
             <select id="spot-list" className="text-field" value={spotListId} onChange={(event) => setSpotListId(event.target.value)}>
               <option value="">未分類</option>

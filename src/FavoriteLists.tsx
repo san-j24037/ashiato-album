@@ -1,7 +1,36 @@
 import { Check, Trash2, X } from 'lucide-react'
 import { useState } from 'react'
-import { DEFAULT_MARK, MARK_COLORS, MARK_SYMBOLS } from './marks'
-import type { FavoriteList, Mark } from './types'
+import { DEFAULT_MARK, MARK_COLORS, MARK_SYMBOLS, VISIBILITY_LABELS } from './marks'
+import type { FavoriteList, Mark, Visibility } from './types'
+
+const VISIBILITY_HINTS: Record<Visibility, string> = {
+  private: '自分だけが見られます',
+  followers: 'あなたをフォローしている人が見られます',
+  public: 'ログインしている全員が見られ、地図のおすすめにも表示されます',
+}
+
+/** Three-way sharing scope picker for favorites and lists. */
+export function VisibilitySelect({ value, onChange, id }: { value: Visibility; onChange(value: Visibility): void; id?: string }) {
+  return (
+    <div className="visibility-select">
+      <div className="visibility-options" role="radiogroup" aria-labelledby={id}>
+        {(Object.keys(VISIBILITY_LABELS) as Visibility[]).map((option) => (
+          <button
+            key={option}
+            type="button"
+            role="radio"
+            aria-checked={value === option}
+            className={value === option ? 'selected' : ''}
+            onClick={() => onChange(option)}
+          >
+            {VISIBILITY_LABELS[option]}
+          </button>
+        ))}
+      </div>
+      <small>{VISIBILITY_HINTS[value]}</small>
+    </div>
+  )
+}
 
 /** Round badge showing a mark (symbol on its colour). */
 export function MarkBadge({ mark, size = 28 }: { mark: Mark; size?: number }) {
@@ -77,19 +106,20 @@ export function ListEditorDialog({
 }: {
   list: FavoriteList | null
   favoriteCount: number
-  onSave(name: string, mark: Mark): void
+  onSave(name: string, mark: Mark, visibility: Visibility): void
   onDelete(): void
   onClose(): void
 }) {
   const [name, setName] = useState(list?.name ?? '')
   const [mark, setMark] = useState<Mark>(list?.mark ?? DEFAULT_MARK)
+  const [visibility, setVisibility] = useState<Visibility>(list?.visibility ?? 'private')
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <form
         className="save-dialog list-editor"
         onSubmit={(event) => {
           event.preventDefault()
-          if (name.trim()) onSave(name.trim(), mark)
+          if (name.trim()) onSave(name.trim(), mark, visibility)
         }}
       >
         <button type="button" className="dialog-close icon-button" onClick={onClose} aria-label="閉じる"><X size={18} /></button>
@@ -101,6 +131,9 @@ export function ListEditorDialog({
         <input id="list-name" className="text-field" value={name} maxLength={80} onChange={(event) => setName(event.target.value)} placeholder="例：行きたいカフェ" required autoFocus />
         <span className="field-label">マーク</span>
         <MarkPicker value={mark} onChange={(next) => setMark(next ?? DEFAULT_MARK)} />
+        <span className="field-label" id="list-visibility">公開範囲</span>
+        <VisibilitySelect id="list-visibility" value={visibility} onChange={setVisibility} />
+        {visibility !== 'private' && <p className="list-visibility-note">リストを公開すると、中のお気に入りも同じ範囲に公開されます。</p>}
         <div className="list-editor-actions">
           {list && (
             <button

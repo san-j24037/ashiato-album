@@ -6,6 +6,9 @@ export type TrackPoint = {
   recordedAt: string
 }
 
+/** Who may see a favorite or list: only the owner, the owner's followers, or every signed-in user. */
+export type Visibility = 'private' | 'followers' | 'public'
+
 /** A symbol and colour shown on the map and in lists. */
 export type Mark = { symbol: string; color: string }
 
@@ -17,6 +20,7 @@ export type FavoriteList = {
   createdAt: string
   updatedAt: string
   deletedAt?: string
+  visibility?: Visibility
 }
 
 export type Memory = {
@@ -33,9 +37,12 @@ export type Memory = {
   listId?: string
   /** Own mark; null/undefined = use the list's mark (or the default). */
   mark?: Mark | null
+  /** Sharing scope; isPublic mirrors visibility === 'public' for older data. */
+  visibility?: Visibility
 }
 
-export type PublicMemory = Memory & { ownerName: string }
+/** Another user's favorite shared with the viewer. */
+export type PublicMemory = Memory & { ownerName: string; ownerNickname?: string; listName?: string }
 
 export type AppData = {
   points: TrackPoint[]

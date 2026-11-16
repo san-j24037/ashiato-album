@@ -1,4 +1,10 @@
-import type { FavoriteList, Mark, Memory } from './types'
+import type { FavoriteList, Mark, Memory, Visibility } from './types'
+
+export const VISIBILITY_LABELS: Record<Visibility, string> = {
+  private: '非公開',
+  followers: 'フォロワー限定',
+  public: '全体公開',
+}
 
 export const MARK_SYMBOLS = ['♥', '★', '⚑', '☕', '🍴', '🏨', '⛰', '🏖', '📷', '🛍', '⛩', '✈', '🚃', '♨', '🌸', '🎡']
 
