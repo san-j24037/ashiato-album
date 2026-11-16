@@ -993,7 +993,15 @@ function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ data: { points: pointBatch, memories: memoryBatch } }),
         })
-        const result = (await response.json()) as SyncResponse
+        const responseText = await response.text()
+        let result: SyncResponse
+        try {
+          result = JSON.parse(responseText) as SyncResponse
+        } catch {
+          // Cloudflare / GAS error pages are HTML, not JSON.
+          const title = /<title>([^<]*)<\/title>/i.exec(responseText)?.[1]?.trim()
+          throw new Error(`同期サーバーから想定外の応答がありました（HTTP ${response.status}${title ? `「${title}」` : ''}）。サーバーの処理上限を超えたか、設定に誤りがある可能性があります`)
+        }
         if (!response.ok || !result.ok) throw new Error(result.error ?? `同期に失敗しました (${response.status})`)
         remoteData = result.data
         remoteRecommendations = result.recommendations ?? []

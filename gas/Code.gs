@@ -132,7 +132,7 @@ function verifySessionToken(token) {
   let header;
   try {
     header = JSON.parse(
-      Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[0])).getDataAsString()
+      decodeBase64UrlText(parts[0])
     );
   } catch (error) {
     throw new Error('Account session is invalid');
@@ -151,7 +151,7 @@ function verifySessionToken(token) {
   let claims;
   try {
     claims = JSON.parse(
-      Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[1])).getDataAsString()
+      decodeBase64UrlText(parts[1])
     );
   } catch (error) {
     throw new Error('Account session is invalid');
@@ -171,6 +171,18 @@ function verifySessionToken(token) {
     throw new Error('Account session is invalid or expired');
   }
   return { sub: claims.sub, email: claims.email, name: claims.name };
+}
+
+/**
+ * Decodes an unpadded base64url string (as used in JWTs) to UTF-8 text.
+ * Utilities.base64DecodeWebSafe may reject input without "=" padding, so pad it first.
+ */
+function decodeBase64UrlText(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]*$/.test(value)) {
+    throw new Error('Invalid base64url value');
+  }
+  const padded = value + '===='.slice(0, (4 - (value.length % 4)) % 4);
+  return Utilities.newBlob(Utilities.base64DecodeWebSafe(padded)).getDataAsString('UTF-8');
 }
 
 function constantTimeEquals(actual, expected) {
