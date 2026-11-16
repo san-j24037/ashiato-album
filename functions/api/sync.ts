@@ -43,11 +43,20 @@ export const onRequestPost = async ({
     return Response.json({ ok: false, error: 'Sync request exceeds the 1 MB limit' }, { status: 413, headers: responseHeaders })
   }
 
-  let data: unknown
+  let parsedBody: unknown
   try {
-    data = JSON.parse(body)
+    parsedBody = JSON.parse(body)
   } catch {
     return Response.json({ ok: false, error: 'Sync request is not valid JSON' }, { status: 400, headers: responseHeaders })
+  }
+  // The browser sends {data: {points, memories}}; GAS expects that inner object as `data`.
+  const data = typeof parsedBody === 'object' && parsedBody !== null && 'data' in parsedBody ? parsedBody.data : null
+  if (
+    typeof data !== 'object' || data === null ||
+    !('points' in data) || !Array.isArray(data.points) ||
+    !('memories' in data) || !Array.isArray(data.memories)
+  ) {
+    return Response.json({ ok: false, error: '同期データの形式が正しくありません（points / memories がありません）' }, { status: 400, headers: responseHeaders })
   }
 
   try {
